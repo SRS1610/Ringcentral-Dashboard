@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react'
 import { useData } from '../state/DataContext'
+import type { DatasetSource } from '../types'
 
 function UploadRow({
   title,
@@ -12,11 +13,13 @@ function UploadRow({
   title: string
   description: string
   fileName: string
-  source: 'sample' | 'uploaded'
+  source: DatasetSource
   error: string | null
   onSelect: (file: File) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const sourceLabel =
+    source === 'uploaded' ? `Using your file: ${fileName}` : source === 'ringcentral' ? `Live from ${fileName}` : `Using sample data: ${fileName}`
   return (
     <div className="flex items-start justify-between gap-4 py-3" style={{ borderBottom: '1px solid var(--border)' }}>
       <div className="min-w-0">
@@ -26,8 +29,8 @@ function UploadRow({
         <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
           {description}
         </p>
-        <p className="text-xs mt-1 tabular-nums" style={{ color: source === 'uploaded' ? 'var(--status-good-text)' : 'var(--text-muted)' }}>
-          {source === 'uploaded' ? `Using your file: ${fileName}` : `Using sample data: ${fileName}`}
+        <p className="text-xs mt-1 tabular-nums" style={{ color: source === 'sample' ? 'var(--text-muted)' : 'var(--status-good-text)' }}>
+          {sourceLabel}
         </p>
         {error && (
           <p className="text-xs mt-1" style={{ color: 'var(--status-critical)' }}>

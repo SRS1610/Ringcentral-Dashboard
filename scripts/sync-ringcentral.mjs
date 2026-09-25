@@ -50,7 +50,6 @@ async function fetchExtensions(config, token) {
 
 function mapCallRecord(record, deptMap) {
   const extensionNumber = record.extension?.extensionNumber ?? ''
-  const connected = record.result === 'Call connected' || record.result === 'Accepted'
   return {
     'Call ID': record.id,
     'Start Time': record.startTime,

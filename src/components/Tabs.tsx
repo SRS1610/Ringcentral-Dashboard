@@ -1,4 +1,4 @@
-export type SectionKey = 'overview' | 'calls' | 'quality' | 'messaging' | 'team'
+export type SectionKey = 'overview' | 'calls' | 'quality' | 'messaging' | 'team' | 'settings'
 
 const TABS: { key: SectionKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
@@ -6,6 +6,7 @@ const TABS: { key: SectionKey; label: string }[] = [
   { key: 'quality', label: 'Service Quality' },
   { key: 'messaging', label: 'Messaging' },
   { key: 'team', label: 'Team Performance' },
+  { key: 'settings', label: 'Settings' },
 ]
 
 export function Tabs({ active, onChange }: { active: SectionKey; onChange: (k: SectionKey) => void }) {

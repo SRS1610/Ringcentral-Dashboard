@@ -17,6 +17,8 @@ interface DataContextValue {
   loadCallsFile: (file: File) => Promise<void>
   loadQosFile: (file: File) => Promise<void>
   loadSmsFile: (file: File) => Promise<void>
+  setCallsFromRingCentral: (records: CallRecord[], label: string) => void
+  setSmsFromRingCentral: (records: SmsRecord[], label: string) => void
   resetToSampleData: () => Promise<void>
   range: DateRange | null
   preset: DateRangePreset
@@ -120,6 +122,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const setCallsFromRingCentral = useCallback((records: CallRecord[], label: string) => {
+    setCalls({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
+  }, [])
+
+  const setSmsFromRingCentral = useCallback((records: SmsRecord[], label: string) => {
+    setSms({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
+  }, [])
+
   const dataBounds = useMemo(() => {
     const dates = [...calls.records.map((c) => c.startTime), ...qos.records.map((q) => q.date), ...sms.records.map((s) => s.dateTime)]
     return computeBounds(dates)
@@ -134,6 +144,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     loadCallsFile,
     loadQosFile,
     loadSmsFile,
+    setCallsFromRingCentral,
+    setSmsFromRingCentral,
     resetToSampleData: loadSample,
     range,
     preset,

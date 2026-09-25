@@ -87,6 +87,29 @@ This sync only touches the repo's own sample data files. If someone uploads a
 CSV through the dashboard's "Upload data" button, that file lives only in
 their browser and is never affected by this sync.
 
+## On-demand connect from the dashboard (Settings tab)
+
+There's also a **Settings** tab in the dashboard itself with a "Connect to
+RingCentral" button, for pulling fresh data into your own browser session on
+demand rather than waiting for the scheduled sync. It uses RingCentral's OAuth
+**Authorization Code + PKCE** flow — the flow built for browser apps, so no
+client secret is ever entered or stored; you just need a Client ID.
+
+This is a *different* app registration than the JWT one used for the
+scheduled sync above (different auth flow, different app type: "public /
+browser-based client" rather than "server-only"). The Settings tab itself
+walks through the setup steps and shows the exact redirect URI to register.
+
+**Important scope limitation:** because this dashboard has no backend, the
+connection lives only in the browser that made it — local storage, not shared
+state. Connecting and syncing from your laptop refreshes what *you* see; it
+does not push data to other people viewing the same dashboard URL. For a
+single shared dataset every executive sees without connecting themselves, use
+the scheduled GitHub Actions sync instead. The two are independent and can be
+used together (e.g. the scheduled sync keeps the default view fresh for
+everyone, while anyone who wants to double-check right now can hit "Sync now"
+in Settings for their own session).
+
 ## Project structure
 
 - `src/lib/` — CSV parsing (`parsers.ts`, `csv.ts`), metrics/aggregation (`metrics.ts`), formatting (`format.ts`)
