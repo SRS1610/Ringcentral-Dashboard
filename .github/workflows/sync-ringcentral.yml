@@ -1,0 +1,45 @@
+name: Sync RingCentral data
+
+on:
+  schedule:
+    # Every 6 hours. Adjust to taste — see README for guidance.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Pull latest call log + SMS data from RingCentral
+        env:
+          RC_CLIENT_ID: ${{ secrets.RC_CLIENT_ID }}
+          RC_CLIENT_SECRET: ${{ secrets.RC_CLIENT_SECRET }}
+          RC_JWT: ${{ secrets.RC_JWT }}
+          RC_SERVER_URL: ${{ vars.RC_SERVER_URL }}
+        run: node scripts/sync-ringcentral.mjs
+
+      - name: Commit updated data if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- public/data; then
+            echo "No data changes."
+          else
+            git add public/data
+            git commit -m "Sync RingCentral data ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            git push
+          fi

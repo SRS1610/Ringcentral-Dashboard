@@ -1,0 +1,8 @@
+{
+  "_comment": "RingCentral's API does not expose a per-call department. Map extension numbers to department names here; anything not listed falls back to 'Unassigned'. Keys are extension numbers as strings.",
+  "101": "Sales",
+  "201": "Customer Support",
+  "301": "Billing",
+  "401": "Customer Success",
+  "501": "IT Helpdesk"
+}
