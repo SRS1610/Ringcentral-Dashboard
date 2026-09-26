@@ -49,4 +49,4 @@ export interface DateRange {
   end: Date
 }
 
-export type DateRangePreset = '7d' | '30d' | '90d' | 'mtd' | 'all'
+export type DateRangePreset = '7d' | '30d' | '90d' | 'mtd' | 'all' | 'custom'

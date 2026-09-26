@@ -127,8 +127,16 @@ function mapSmsRecord(record: RcRecord, extension: RcRecord, deptMap: Department
   }
 }
 
-function windowParams(days: number) {
-  return { dateFrom: new Date(Date.now() - days * 86400000).toISOString(), dateTo: new Date().toISOString() }
+/** Either "the last N days" or an exact from/to window picked on the calendar. */
+export type SyncWindow = number | { start: Date; end: Date }
+
+function windowParams(window: SyncWindow) {
+  const now = new Date()
+  if (typeof window === 'number') {
+    return { dateFrom: new Date(now.getTime() - window * 86400000).toISOString(), dateTo: now.toISOString() }
+  }
+  const end = window.end > now ? now : window.end
+  return { dateFrom: window.start.toISOString(), dateTo: end.toISOString() }
 }
 
 export interface CallSyncResult {
@@ -136,9 +144,9 @@ export interface CallSyncResult {
   scope: DataScope
 }
 
-export async function syncCallLog(deptMap: DepartmentMap, days: number, onStatus?: StatusCallback): Promise<CallSyncResult> {
+export async function syncCallLog(deptMap: DepartmentMap, window: SyncWindow, onStatus?: StatusCallback): Promise<CallSyncResult> {
   const { serverUrl, accessToken } = await session()
-  const params = { view: 'Detailed', ...windowParams(days) }
+  const params = { view: 'Detailed', ...windowParams(window) }
   onStatus?.('Importing call log…')
   try {
     const records = await fetchAllPages(serverUrl, accessToken, '/restapi/v1.0/account/~/call-log', params, onStatus)
@@ -158,9 +166,9 @@ export interface SmsSyncResult {
   scope: DataScope
 }
 
-export async function syncSms(deptMap: DepartmentMap, days: number, onStatus?: StatusCallback): Promise<SmsSyncResult> {
+export async function syncSms(deptMap: DepartmentMap, window: SyncWindow, onStatus?: StatusCallback): Promise<SmsSyncResult> {
   const { serverUrl, accessToken } = await session()
-  const params = { messageType: 'SMS', ...windowParams(days) }
+  const params = { messageType: 'SMS', ...windowParams(window) }
 
   let extensions: RcRecord[]
   let scope: DataScope = 'company'

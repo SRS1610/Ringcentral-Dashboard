@@ -22,7 +22,7 @@ import {
   type RcConnectionConfig,
 } from '../lib/ringcentralAuth'
 import { parseCredentialsJson } from '../lib/ringcentralCredentials'
-import { fetchCurrentUser, syncCallLog, syncSms, type DataScope, type RcUser } from '../lib/ringcentralApi'
+import { fetchCurrentUser, syncCallLog, syncSms, type DataScope, type RcUser, type SyncWindow } from '../lib/ringcentralApi'
 import { loadDepartmentMap, saveDepartmentMap, type DepartmentMap } from '../lib/departmentMap'
 import { useData } from './DataContext'
 
@@ -52,7 +52,8 @@ interface RingCentralContextValue {
   changeApp: () => void
   connectWithCredentialsFile: (file: File, remember: boolean) => Promise<void>
   signOut: () => Promise<void>
-  syncNow: (days: number) => Promise<void>
+  /** Import calls + SMS for the last N days, or for an exact calendar from/to window. */
+  syncNow: (window: SyncWindow) => Promise<void>
   updateDepartmentMap: (map: DepartmentMap) => void
 }
 
@@ -95,7 +96,9 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const syncNow = useCallback(
-    async (days: number) => {
+    async (window: SyncWindow) => {
+      const fmt = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      const label = typeof window === 'number' ? `RingCentral (last ${window}d)` : `RingCentral (${fmt(window.start)} – ${fmt(window.end)})`
       setSyncing(true)
       setLastError(null)
       const errors: string[] = []
@@ -104,16 +107,16 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
 
       // Sequential on purpose: RingCentral rate-limits the call-log API, so don't double the load.
       try {
-        const calls = await syncCallLog(deptRef.current, days, setSyncStatus)
-        setCallsFromRingCentral(calls.records, `RingCentral (last ${days}d)`)
+        const calls = await syncCallLog(deptRef.current, window, setSyncStatus)
+        setCallsFromRingCentral(calls.records, label)
         scopes.push(calls.scope)
         anySucceeded = true
       } catch (e) {
         errors.push(`Call log: ${message(e)}`)
       }
       try {
-        const sms = await syncSms(deptRef.current, days, setSyncStatus)
-        setSmsFromRingCentral(sms.records, `RingCentral (last ${days}d)`)
+        const sms = await syncSms(deptRef.current, window, setSyncStatus)
+        setSmsFromRingCentral(sms.records, label)
         setSmsSkipped(sms.skippedExtensions)
         scopes.push(sms.scope)
         anySucceeded = true

@@ -23,6 +23,9 @@ interface DataContextValue {
   range: DateRange | null
   preset: DateRangePreset
   setPreset: (p: DateRangePreset) => void
+  /** Pick exact from/to days on the calendar; switches the preset to 'custom'. */
+  setCustomRange: (r: DateRange) => void
+  customRange: DateRange | null
   dataBounds: DateRange | null
 }
 
@@ -45,7 +48,7 @@ function computeBounds(dates: Date[]): DateRange | null {
 function presetToRange(preset: DateRangePreset, bounds: DateRange | null): DateRange | null {
   if (!bounds) return null
   const end = bounds.end
-  if (preset === 'all') return bounds
+  if (preset === 'all' || preset === 'custom') return bounds
   if (preset === 'mtd') {
     const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1))
     return { start: start < bounds.start ? bounds.start : start, end }
@@ -60,6 +63,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [qos, setQos] = useState<DatasetState<QosRecord>>(initial<QosRecord>())
   const [sms, setSms] = useState<DatasetState<SmsRecord>>(initial<SmsRecord>())
   const [preset, setPreset] = useState<DateRangePreset>('30d')
+  const [customRange, setCustomRangeState] = useState<DateRange | null>(null)
+
+  const setCustomRange = useCallback((r: DateRange) => {
+    setCustomRangeState(r)
+    setPreset('custom')
+  }, [])
 
   // On first load the sample CSVs (~2.5 MB) can arrive after a RingCentral import or an
   // upload has already landed; `replaceExisting: false` keeps that real data instead of
@@ -143,7 +152,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
     return computeBounds(dates)
   }, [calls.records, qos.records, sms.records])
 
-  const range = useMemo(() => presetToRange(preset, dataBounds), [preset, dataBounds])
+  const range = useMemo(
+    () => (preset === 'custom' && customRange ? customRange : presetToRange(preset, dataBounds)),
+    [preset, customRange, dataBounds],
+  )
 
   const value: DataContextValue = {
     calls,
@@ -158,6 +170,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     range,
     preset,
     setPreset,
+    setCustomRange,
+    customRange,
     dataBounds,
   }
 

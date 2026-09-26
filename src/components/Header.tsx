@@ -5,6 +5,7 @@ import { useRingCentral } from '../state/RingCentralContext'
 
 function RingCentralChip({ onOpenSettings }: { onOpenSettings: () => void }) {
   const rc = useRingCentral()
+  const [signingOut, setSigningOut] = useState(false)
   if (!rc.ready) return null
 
   if (!rc.connected) {
@@ -24,6 +25,7 @@ function RingCentralChip({ onOpenSettings }: { onOpenSettings: () => void }) {
   const dot = rc.syncing ? 'var(--series-1)' : problem ? 'var(--status-critical)' : 'var(--status-good)'
   const label = rc.syncing ? 'Importing from RingCentral…' : problem ? 'RingCentral: import problem' : `Live · ${rc.user?.name ?? 'RingCentral'}`
   return (
+    <>
     <button
       type="button"
       onClick={onOpenSettings}
@@ -34,6 +36,28 @@ function RingCentralChip({ onOpenSettings }: { onOpenSettings: () => void }) {
       <span aria-hidden="true" className="inline-block rounded-full" style={{ width: 8, height: 8, background: dot }} />
       {label}
     </button>
+    <button
+      type="button"
+      disabled={signingOut}
+      onClick={async () => {
+        if (!window.confirm('Sign out of RingCentral? This ends the connection and clears the saved sign-in on this browser.')) return
+        setSigningOut(true)
+        try {
+          await rc.signOut()
+        } finally {
+          setSigningOut(false)
+        }
+      }}
+      title="Sign out of RingCentral and stop the connection"
+      className="text-sm font-medium rounded-lg px-3 py-2 whitespace-nowrap inline-flex items-center gap-1.5"
+      style={{ border: '1px solid var(--border)', color: 'var(--status-critical)', opacity: signingOut ? 0.6 : 1 }}
+    >
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M6 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1H6M10.5 11l3-3-3-3M13.5 8H6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      {signingOut ? 'Signing out…' : 'Sign out'}
+    </button>
+    </>
   )
 }
 
