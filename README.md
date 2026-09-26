@@ -58,10 +58,13 @@ a scheduled CI job, so there's nothing extra to host.
 2. Generate a JWT credential and note the app's **Client ID**, **Client
    Secret**, and the **JWT token**.
 3. In the repo, go to **Settings → Secrets and variables → Actions** and add
-   three repository secrets: `RC_CLIENT_ID`, `RC_CLIENT_SECRET`, `RC_JWT`. If
-   you're testing against a RingCentral sandbox account instead of production,
-   also add a repository **variable** `RC_SERVER_URL` set to
-   `https://platform.devtest.ringcentral.com`.
+   a repository secret named `RC_CREDENTIALS_JSON` whose value is the entire
+   contents of the credentials JSON file the RingCentral console gave you —
+   the sync reads the client ID, client secret and JWT out of it (several key
+   spellings are accepted). Alternatively, add them as three separate secrets:
+   `RC_CLIENT_ID`, `RC_CLIENT_SECRET`, `RC_JWT`. If you're testing against a
+   RingCentral sandbox account instead of production, also add a repository
+   **variable** `RC_SERVER_URL` set to `https://platform.devtest.ringcentral.com`.
 4. Edit `scripts/department-map.json` to map your extension numbers to
    department names — RingCentral's API doesn't expose department per call, so
    this mapping fills that gap. Anything not listed shows as "Unassigned".

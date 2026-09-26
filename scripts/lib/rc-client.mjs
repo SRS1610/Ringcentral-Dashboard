@@ -1,19 +1,81 @@
 // Minimal RingCentral REST API client: JWT auth + paginated GET helper.
 // No RingCentral SDK dependency — just fetch, so this runs standalone in CI.
 
-function requireEnv(name) {
-  const value = process.env[name]
-  if (!value) throw new Error(`Missing required environment variable: ${name}`)
-  return value
+// Credentials come either from RC_CREDENTIALS_JSON (the whole credentials file
+// RingCentral's console hands out, pasted as one secret) or from the three
+// individual RC_CLIENT_ID / RC_CLIENT_SECRET / RC_JWT variables. Key names in
+// the JSON vary between console versions, so several spellings are accepted.
+const KEY_ALIASES = {
+  clientId: ['clientId', 'client_id', 'clientID', 'appKey', 'app_key'],
+  clientSecret: ['clientSecret', 'client_secret', 'appSecret', 'app_secret'],
+  jwt: ['jwt', 'jwtToken', 'jwt_token', 'assertion', 'token', 'jwtCredential'],
+  serverUrl: ['serverUrl', 'server_url', 'server', 'platformUrl', 'apiUrl'],
+}
+
+function findKey(obj, aliases) {
+  for (const alias of aliases) {
+    if (obj[alias] !== undefined && obj[alias] !== null && String(obj[alias]).trim() !== '') return String(obj[alias]).trim()
+  }
+  return undefined
+}
+
+function flatten(obj, out = {}) {
+  for (const [key, value] of Object.entries(obj)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) flatten(value, out)
+    else if (out[key] === undefined) out[key] = value
+  }
+  return out
+}
+
+function fromCredentialsJson(raw) {
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    throw new Error(`RC_CREDENTIALS_JSON is not valid JSON: ${e.message}`)
+  }
+  const flat = flatten(parsed)
+  const found = {
+    clientId: findKey(flat, KEY_ALIASES.clientId),
+    clientSecret: findKey(flat, KEY_ALIASES.clientSecret),
+    jwt: findKey(flat, KEY_ALIASES.jwt),
+    serverUrl: findKey(flat, KEY_ALIASES.serverUrl),
+  }
+  const missing = ['clientId', 'clientSecret', 'jwt'].filter((k) => !found[k])
+  if (missing.length > 0) {
+    // Print key names only (never values) so the failing log shows the file's shape.
+    throw new Error(
+      `RC_CREDENTIALS_JSON is missing ${missing.join(', ')}. ` +
+        `Keys present in the file: ${Object.keys(flat).join(', ') || '(none)'}. ` +
+        `Accepted spellings: ${missing.map((k) => `${k} -> ${KEY_ALIASES[k].join('|')}`).join('; ')}`,
+    )
+  }
+  return found
 }
 
 export function rcConfig() {
-  return {
-    serverUrl: process.env.RC_SERVER_URL || 'https://platform.ringcentral.com',
-    clientId: requireEnv('RC_CLIENT_ID'),
-    clientSecret: requireEnv('RC_CLIENT_SECRET'),
-    jwt: requireEnv('RC_JWT'),
+  const json = process.env.RC_CREDENTIALS_JSON
+  const fromJson = json && json.trim() ? fromCredentialsJson(json) : {}
+
+  const clientId = process.env.RC_CLIENT_ID || fromJson.clientId
+  const clientSecret = process.env.RC_CLIENT_SECRET || fromJson.clientSecret
+  const jwt = process.env.RC_JWT || fromJson.jwt
+  const serverUrl = process.env.RC_SERVER_URL || fromJson.serverUrl || 'https://platform.ringcentral.com'
+
+  const missing = [
+    ['RC_CLIENT_ID', clientId],
+    ['RC_CLIENT_SECRET', clientSecret],
+    ['RC_JWT', jwt],
+  ]
+    .filter(([, v]) => !v)
+    .map(([name]) => name)
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing RingCentral credentials: ${missing.join(', ')}. ` +
+        'Add repository secret RC_CREDENTIALS_JSON (whole credentials file) or the individual RC_CLIENT_ID / RC_CLIENT_SECRET / RC_JWT secrets.',
+    )
   }
+  return { serverUrl, clientId, clientSecret, jwt }
 }
 
 export async function getAccessToken(config) {
