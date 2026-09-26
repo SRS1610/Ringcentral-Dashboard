@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -39,5 +40,28 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # If the repo's Pages source is "Deploy from a branch", GitHub also runs its own
+      # "pages build and deployment" on every push, publishing the raw, unbuilt source
+      # (a blank page). Wait for it to finish so this deploy of the built app lands last.
+      - name: Wait for GitHub's branch-based Pages build, if any
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 60); do
+            runs=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&per_page=50" \
+              --jq '[.workflow_runs[] | select(.path | startswith("dynamic/pages/"))]')
+            total=$(echo "$runs" | jq 'length')
+            pending=$(echo "$runs" | jq '[.[] | select(.status != "completed")] | length')
+            if [ "$total" != "0" ] && [ "$i" = "1" ]; then
+              echo "::warning title=Pages source is 'Deploy from a branch'::GitHub is also publishing the raw repo files on every push. Set Settings > Pages > Source to 'GitHub Actions' to stop the double publish; until then this job deploys last so the built dashboard wins."
+            fi
+            if [ "$pending" = "0" ]; then
+              echo "No branch-based Pages build in progress; deploying."
+              exit 0
+            fi
+            echo "Waiting for branch-based Pages build to finish ($pending in progress)..."
+            sleep 10
+          done
+          echo "::warning::Timed out waiting for the branch-based Pages build; deploying anyway."
       - id: deployment
         uses: actions/deploy-pages@v4
