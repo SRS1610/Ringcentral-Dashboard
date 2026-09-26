@@ -42,7 +42,7 @@ export interface SmsRecord {
 
 export type DatasetKind = 'calls' | 'qos' | 'sms'
 
-export type DatasetSource = 'sample' | 'uploaded' | 'ringcentral'
+export type DatasetSource = 'site' | 'uploaded' | 'ringcentral'
 
 export interface DateRange {
   start: Date

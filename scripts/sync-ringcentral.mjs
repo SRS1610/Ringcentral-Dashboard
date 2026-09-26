@@ -16,8 +16,8 @@ import { mergeRows, readCsvRows, writeCsvRows } from './lib/csv-io.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, '..', 'public', 'data')
-const CALL_LOG_PATH = path.join(DATA_DIR, 'call-log-sample.csv')
-const SMS_LOG_PATH = path.join(DATA_DIR, 'sms-log-sample.csv')
+const CALL_LOG_PATH = path.join(DATA_DIR, 'call-log.csv')
+const SMS_LOG_PATH = path.join(DATA_DIR, 'sms-log.csv')
 const DEPARTMENT_MAP_PATH = path.join(__dirname, 'department-map.json')
 
 const SYNC_DAYS = Number(process.env.SYNC_DAYS ?? 7)

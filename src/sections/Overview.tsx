@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { useData } from '../state/DataContext'
 import { useFilteredData } from '../state/useFilteredData'
 import { StatTile } from '../components/ui/StatTile'
 import { ChartCard } from '../components/ui/ChartCard'
@@ -25,7 +26,20 @@ const OUTCOME_COLORS: Record<string, string> = {
   Busy: 'var(--status-warning)',
 }
 
+function NoDataNote({ children }: { children: string }) {
+  return (
+    <div className="h-[220px] flex items-center justify-center text-sm text-center px-6" style={{ color: 'var(--text-muted)' }}>
+      {children}
+    </div>
+  )
+}
+
 export function Overview() {
+  // A dataset that hasn't been loaded at all shows "—" rather than a misleading 0.
+  const { calls, qos, sms } = useData()
+  const hasCalls = calls.records.length > 0
+  const hasQos = qos.records.length > 0
+  const hasSms = sms.records.length > 0
   const { callsInRange, qosInRange, smsInRange, callsPrior, qosPrior, smsPrior, loading } = useFilteredData()
 
   const kpis = useMemo(() => {
@@ -63,50 +77,77 @@ export function Overview() {
   return (
     <div className="flex flex-col gap-5">
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        <StatTile label="Total calls" value={formatNumber(kpis.totalCalls)} delta={kpis.totalCallsDelta} sublabel="vs prior period" />
-        <StatTile label="Answer rate" value={formatPercent(kpis.answerRate)} delta={kpis.answerRateDelta} sublabel="vs prior period" />
+        <StatTile
+          label="Total calls"
+          value={hasCalls ? formatNumber(kpis.totalCalls) : '—'}
+          delta={hasCalls ? kpis.totalCallsDelta : undefined}
+          sublabel={hasCalls ? 'vs prior period' : 'No call data'}
+        />
+        <StatTile
+          label="Answer rate"
+          value={hasCalls ? formatPercent(kpis.answerRate) : '—'}
+          delta={hasCalls ? kpis.answerRateDelta : undefined}
+          sublabel={hasCalls ? 'vs prior period' : 'No call data'}
+        />
         <StatTile
           label="Avg call duration"
-          value={formatDuration(kpis.avgDuration)}
-          delta={kpis.avgDurationDelta}
+          value={hasCalls ? formatDuration(kpis.avgDuration) : '—'}
+          delta={hasCalls ? kpis.avgDurationDelta : undefined}
           deltaGoodDirection="down"
-          sublabel="vs prior period"
+          sublabel={hasCalls ? 'vs prior period' : 'No call data'}
         />
         <StatTile
           label="Service level"
-          value={formatPercent(kpis.serviceLevel)}
-          delta={kpis.serviceLevelDelta}
-          sublabel="target 85%"
+          value={hasQos ? formatPercent(kpis.serviceLevel) : '—'}
+          delta={hasQos ? kpis.serviceLevelDelta : undefined}
+          sublabel={hasQos ? 'target 85%' : 'No analytics data'}
         />
         <StatTile
           label="Abandon rate"
-          value={formatPercent(kpis.abandonRate, 1)}
-          delta={kpis.abandonRateDelta}
+          value={hasQos ? formatPercent(kpis.abandonRate, 1) : '—'}
+          delta={hasQos ? kpis.abandonRateDelta : undefined}
           deltaGoodDirection="down"
-          sublabel="vs prior period"
+          sublabel={hasQos ? 'vs prior period' : 'No analytics data'}
         />
-        <StatTile label="SMS volume" value={formatCompact(kpis.totalSms)} delta={kpis.totalSmsDelta} sublabel="vs prior period" />
+        <StatTile
+          label="SMS volume"
+          value={hasSms ? formatCompact(kpis.totalSms) : '—'}
+          delta={hasSms ? kpis.totalSmsDelta : undefined}
+          sublabel={hasSms ? 'vs prior period' : 'No SMS data'}
+        />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <ChartCard title="Call volume trend" subtitle="Inbound vs outbound, daily" className="lg:col-span-2">
-          <VolumeAreaChart data={volume} />
+          {hasCalls ? <VolumeAreaChart data={volume} /> : <NoDataNote>No call data loaded yet.</NoDataNote>}
         </ChartCard>
         <ChartCard title="Call outcomes" subtitle="Share of all calls in range">
-          <HorizontalBarChart
-            data={outcomes.map((o) => ({ name: o.result, value: o.count }))}
-            colors={outcomes.map((o) => OUTCOME_COLORS[o.result] ?? 'var(--series-7)')}
-            height={220}
-          />
+          {hasCalls ? (
+            <HorizontalBarChart
+              data={outcomes.map((o) => ({ name: o.result, value: o.count }))}
+              colors={outcomes.map((o) => OUTCOME_COLORS[o.result] ?? 'var(--series-7)')}
+              height={220}
+            />
+          ) : (
+            <NoDataNote>No call data loaded yet.</NoDataNote>
+          )}
         </ChartCard>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <ChartCard title="Service level trend" subtitle="Daily average across all queues" className="lg:col-span-2">
-          <ServiceLevelChart data={serviceTrend.map((d) => ({ date: d.date, serviceLevel: d.serviceLevel }))} />
+          {hasQos ? (
+            <ServiceLevelChart data={serviceTrend.map((d) => ({ date: d.date, serviceLevel: d.serviceLevel }))} />
+          ) : (
+            <NoDataNote>Service level comes from the RingCentral Analytics export. Upload it with Upload data.</NoDataNote>
+          )}
         </ChartCard>
         <ChartCard title="Volume by department" subtitle="Top departments by call count">
-          <HorizontalBarChart data={deptLeaderboard.map((d) => ({ name: d.department, value: d.total }))} color="var(--series-1)" />
+          {hasCalls ? (
+            <HorizontalBarChart data={deptLeaderboard.map((d) => ({ name: d.department, value: d.total }))} color="var(--series-1)" />
+          ) : (
+            <NoDataNote>No call data loaded yet.</NoDataNote>
+          )}
         </ChartCard>
       </div>
     </div>

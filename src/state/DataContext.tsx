@@ -19,7 +19,8 @@ interface DataContextValue {
   loadSmsFile: (file: File) => Promise<void>
   setCallsFromRingCentral: (records: CallRecord[], label: string) => void
   setSmsFromRingCentral: (records: SmsRecord[], label: string) => void
-  resetToSampleData: () => Promise<void>
+  /** Drops uploads and browser imports, going back to the data files published with the site. */
+  resetToSiteData: () => Promise<void>
   range: DateRange | null
   preset: DateRangePreset
   setPreset: (p: DateRangePreset) => void
@@ -31,7 +32,7 @@ interface DataContextValue {
 
 const DataContext = createContext<DataContextValue | null>(null)
 
-const initial = <T,>(): DatasetState<T> => ({ records: [], source: 'sample', fileName: '', loading: true, error: null })
+const initial = <T,>(): DatasetState<T> => ({ records: [], source: 'site', fileName: '', loading: true, error: null })
 
 function computeBounds(dates: Date[]): DateRange | null {
   if (dates.length === 0) return null
@@ -70,27 +71,28 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setPreset('custom')
   }, [])
 
-  // On first load the sample CSVs (~2.5 MB) can arrive after a RingCentral import or an
-  // upload has already landed; `replaceExisting: false` keeps that real data instead of
-  // clobbering it. The explicit "Reset to sample data" action passes true.
-  const loadSample = useCallback(async ({ replaceExisting }: { replaceExisting: boolean }) => {
-    const apply = <T,>(next: DatasetState<T>) => (prev: DatasetState<T>) => (replaceExisting || prev.source === 'sample' ? next : prev)
-    const markLoading = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'sample' ? { ...prev, loading: true, error: null } : prev)
+  // The site's data files (public/data/, kept current by the scheduled RingCentral sync)
+  // can arrive after a browser RingCentral import or an upload has already landed;
+  // `replaceExisting: false` keeps that data instead of clobbering it. The explicit
+  // "Clear uploads and imports" action passes true.
+  const loadSiteData = useCallback(async ({ replaceExisting }: { replaceExisting: boolean }) => {
+    const apply = <T,>(next: DatasetState<T>) => (prev: DatasetState<T>) => (replaceExisting || prev.source === 'site' ? next : prev)
+    const markLoading = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'site' ? { ...prev, loading: true, error: null } : prev)
     setCalls(markLoading)
     setQos(markLoading)
     setSms(markLoading)
     try {
       const [callText, qosText, smsText] = await Promise.all([
-        fetch(`${import.meta.env.BASE_URL}data/call-log-sample.csv`).then((r) => r.text()),
-        fetch(`${import.meta.env.BASE_URL}data/analytics-qos-sample.csv`).then((r) => r.text()),
-        fetch(`${import.meta.env.BASE_URL}data/sms-log-sample.csv`).then((r) => r.text()),
+        fetch(`${import.meta.env.BASE_URL}data/call-log.csv`).then((r) => r.text()),
+        fetch(`${import.meta.env.BASE_URL}data/analytics-qos.csv`).then((r) => r.text()),
+        fetch(`${import.meta.env.BASE_URL}data/sms-log.csv`).then((r) => r.text()),
       ])
-      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'sample', fileName: 'call-log-sample.csv', loading: false, error: null }))
-      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'sample', fileName: 'analytics-qos-sample.csv', loading: false, error: null }))
-      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'sample', fileName: 'sms-log-sample.csv', loading: false, error: null }))
+      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'site', fileName: 'call-log.csv', loading: false, error: null }))
+      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'site', fileName: 'analytics-qos.csv', loading: false, error: null }))
+      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'site', fileName: 'sms-log.csv', loading: false, error: null }))
     } catch (e) {
-      const message = e instanceof Error ? e.message : 'Failed to load sample data'
-      const fail = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'sample' ? { ...prev, loading: false, error: message } : prev)
+      const message = e instanceof Error ? e.message : 'Failed to load dashboard data'
+      const fail = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'site' ? { ...prev, loading: false, error: message } : prev)
       setCalls(fail)
       setQos(fail)
       setSms(fail)
@@ -98,10 +100,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    loadSample({ replaceExisting: false })
-  }, [loadSample])
+    loadSiteData({ replaceExisting: false })
+  }, [loadSiteData])
 
-  const resetToSampleData = useCallback(() => loadSample({ replaceExisting: true }), [loadSample])
+  const resetToSiteData = useCallback(() => loadSiteData({ replaceExisting: true }), [loadSiteData])
 
   const loadCallsFile = useCallback(async (file: File) => {
     setCalls((s) => ({ ...s, loading: true, error: null }))
@@ -166,7 +168,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     loadSmsFile,
     setCallsFromRingCentral,
     setSmsFromRingCentral,
-    resetToSampleData,
+    resetToSiteData,
     range,
     preset,
     setPreset,

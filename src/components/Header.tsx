@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { DateRangeControl } from './DateRangeControl'
-import { UploadPanel } from './UploadPanel'
 import { useRingCentral } from '../state/RingCentralContext'
 
 function RingCentralChip({ onOpenSettings }: { onOpenSettings: () => void }) {
@@ -61,9 +60,7 @@ function RingCentralChip({ onOpenSettings }: { onOpenSettings: () => void }) {
   )
 }
 
-export function Header({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const [uploadOpen, setUploadOpen] = useState(false)
-
+export function Header({ onOpenSettings, onOpenUpload }: { onOpenSettings: () => void; onOpenUpload: () => void }) {
   return (
     <header className="border-b" style={{ borderColor: 'var(--border)', background: 'var(--surface-1)' }}>
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex flex-col gap-4">
@@ -80,7 +77,7 @@ export function Header({ onOpenSettings }: { onOpenSettings: () => void }) {
             <RingCentralChip onOpenSettings={onOpenSettings} />
             <button
               type="button"
-              onClick={() => setUploadOpen(true)}
+              onClick={onOpenUpload}
               className="text-sm font-medium rounded-lg px-3.5 py-2 whitespace-nowrap"
               style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
             >
@@ -90,7 +87,6 @@ export function Header({ onOpenSettings }: { onOpenSettings: () => void }) {
         </div>
         <DateRangeControl />
       </div>
-      {uploadOpen && <UploadPanel onClose={() => setUploadOpen(false)} />}
     </header>
   )
 }

@@ -7,6 +7,7 @@ function UploadRow({
   description,
   fileName,
   source,
+  rowCount,
   error,
   onSelect,
 }: {
@@ -14,12 +15,19 @@ function UploadRow({
   description: string
   fileName: string
   source: DatasetSource
+  rowCount: number
   error: string | null
   onSelect: (file: File) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const sourceLabel =
-    source === 'uploaded' ? `Using your file: ${fileName}` : source === 'ringcentral' ? `Live from ${fileName}` : `Using sample data: ${fileName}`
+    source === 'uploaded'
+      ? `Using your file: ${fileName}`
+      : source === 'ringcentral'
+        ? `Live from ${fileName}`
+        : rowCount > 0
+          ? `Using synced RingCentral data (${rowCount.toLocaleString()} rows)`
+          : 'No data loaded yet'
   return (
     <div className="flex items-start justify-between gap-4 py-3" style={{ borderBottom: '1px solid var(--border)' }}>
       <div className="min-w-0">
@@ -29,7 +37,7 @@ function UploadRow({
         <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
           {description}
         </p>
-        <p className="text-xs mt-1 tabular-nums" style={{ color: source === 'sample' ? 'var(--text-muted)' : 'var(--status-good-text)' }}>
+        <p className="text-xs mt-1 tabular-nums" style={{ color: source === 'site' && rowCount === 0 ? 'var(--text-muted)' : 'var(--status-good-text)' }}>
           {sourceLabel}
         </p>
         {error && (
@@ -64,7 +72,8 @@ function UploadRow({
 }
 
 export function UploadPanel({ onClose }: { onClose: () => void }) {
-  const { calls, qos, sms, loadCallsFile, loadQosFile, loadSmsFile, resetToSampleData } = useData()
+  const { calls, qos, sms, loadCallsFile, loadQosFile, loadSmsFile, resetToSiteData } = useData()
+  const hasOverrides = [calls, qos, sms].some((d) => d.source !== 'site')
   const [closing, setClosing] = useState(false)
 
   return (
@@ -89,8 +98,7 @@ export function UploadPanel({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-          Replace the sample data below with your own RingCentral exports. Files stay in your browser &mdash; nothing is
-          uploaded to a server. Column headers are matched automatically against common RingCentral export formats.
+          Load your own RingCentral exports. Files stay in your browser &mdash; nothing is uploaded to a server. Column headers are matched automatically against common RingCentral export formats.
         </p>
 
         <div className="flex flex-col">
@@ -99,6 +107,7 @@ export function UploadPanel({ onClose }: { onClose: () => void }) {
             description="RingCentral Call Log Report CSV (one row per call)."
             fileName={calls.fileName}
             source={calls.source}
+            rowCount={calls.records.length}
             error={calls.error}
             onSelect={loadCallsFile}
           />
@@ -107,6 +116,7 @@ export function UploadPanel({ onClose }: { onClose: () => void }) {
             description="RingCentral Analytics Portal export (queue performance, SLA)."
             fileName={qos.fileName}
             source={qos.source}
+            rowCount={qos.records.length}
             error={qos.error}
             onSelect={loadQosFile}
           />
@@ -115,23 +125,26 @@ export function UploadPanel({ onClose }: { onClose: () => void }) {
             description="RingCentral message log CSV."
             fileName={sms.fileName}
             source={sms.source}
+            rowCount={sms.records.length}
             error={sms.error}
             onSelect={loadSmsFile}
           />
         </div>
 
-        <button
-          type="button"
-          disabled={closing}
-          onClick={() => {
-            setClosing(true)
-            resetToSampleData().finally(() => setClosing(false))
-          }}
-          className="mt-auto text-sm font-medium rounded-lg px-3 py-2 self-start"
-          style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
-        >
-          Reset all to sample data
-        </button>
+        {hasOverrides && (
+          <button
+            type="button"
+            disabled={closing}
+            onClick={() => {
+              setClosing(true)
+              resetToSiteData().finally(() => setClosing(false))
+            }}
+            className="mt-auto text-sm font-medium rounded-lg px-3 py-2 self-start"
+            style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
+          >
+            Clear uploads and imports
+          </button>
+        )}
       </div>
     </div>
   )

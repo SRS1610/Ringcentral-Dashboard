@@ -4,10 +4,12 @@ An executive-facing dashboard for RingCentral exported data: call activity, serv
 quality (SLA/abandon rate), and SMS/messaging volume, with department and agent
 leaderboards.
 
-Ships with realistic 90-day sample data so it's fully functional out of the box.
-Upload your own RingCentral CSV exports via the **Upload data** button to replace
-any of the three sample datasets — everything stays in your browser, nothing is
-sent to a server.
+It ships with no data. Data comes from RingCentral: the scheduled sync (below)
+fills the site's data files for everyone, signing in via the Settings tab
+imports into your own browser, or you can upload RingCentral CSV exports with
+the **Upload data** button (uploads stay in your browser; nothing is sent to a
+server). Until a tab has data it shows a "No data yet" screen explaining how to
+load it, rather than zeros.
 
 ## Running locally
 
@@ -25,19 +27,20 @@ Open the printed local URL. `npm run build` produces a static production build i
 The dashboard reads three kinds of RingCentral exports, each independently
 replaceable from the "Upload data" panel:
 
-| Dataset | What it is | Sample file |
+| Dataset | What it is | Site data file |
 |---|---|---|
-| Call log / call detail | RingCentral Call Log Report CSV, one row per call | `public/data/call-log-sample.csv` |
-| Analytics / Quality of Service | RingCentral Analytics Portal export (queue performance, SLA) | `public/data/analytics-qos-sample.csv` |
-| SMS / message log | RingCentral message log CSV | `public/data/sms-log-sample.csv` |
+| Call log / call detail | RingCentral Call Log Report CSV, one row per call | `public/data/call-log.csv` |
+| Analytics / Quality of Service | RingCentral Analytics Portal export (queue performance, SLA) | `public/data/analytics-qos.csv` |
+| SMS / message log | RingCentral message log CSV | `public/data/sms-log.csv` |
 
 Column headers are matched case- and punctuation-insensitively against common
 RingCentral export naming (see `src/lib/parsers.ts`), so a genuine export usually
 works without any remapping. If your export uses different column names, add them
 to the candidate lists in that file.
 
-Sample data is synthetic and generated for illustration only (see the script used
-to produce it, not included in the app bundle).
+The site data files hold only their header row until the scheduled sync writes
+real records into the call log and SMS files. The analytics file is filled only
+by uploads.
 
 ## Live RingCentral sync (optional)
 
@@ -86,7 +89,7 @@ records older than `RETENTION_DAYS` (default 120) are dropped to keep the
 file size bounded. Both are set as env vars in the workflow if you want to
 change them.
 
-This sync only touches the repo's own sample data files. If someone uploads a
+This sync only touches the repo's own data files. If someone uploads a
 CSV through the dashboard's "Upload data" button, that file lives only in
 their browser and is never affected by this sync.
 
