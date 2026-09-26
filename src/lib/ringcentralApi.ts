@@ -8,7 +8,55 @@ import { getValidAccessToken, loadConnectionConfig } from './ringcentralAuth'
 // oxlint-disable-next-line no-explicit-any
 type RcRecord = Record<string, any>
 
-async function fetchAllPages(serverUrl: string, accessToken: string, path: string, params: Record<string, string>): Promise<RcRecord[]> {
+/** "company" = account-wide data (admin); "self" = only the signed-in user's own extension. */
+export type DataScope = 'company' | 'self'
+
+export type StatusCallback = (message: string) => void
+
+export class RcHttpError extends Error {
+  readonly status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
+export interface RcUser {
+  name: string
+  extensionNumber: string
+  email: string
+  isAdmin: boolean
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const MAX_RATE_LIMIT_RETRIES = 3
+
+async function rcGet(url: URL, accessToken: string, onStatus?: StatusCallback): Promise<RcRecord> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } })
+    if (res.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+      // Retry-After may not be exposed cross-origin; RingCentral's penalty window is 60s.
+      const header = Number(res.headers.get('Retry-After'))
+      const waitSec = Number.isFinite(header) && header > 0 ? Math.min(header, 65) : 60
+      onStatus?.(`RingCentral rate limit reached — waiting ${waitSec}s before continuing…`)
+      await sleep(waitSec * 1000)
+      continue
+    }
+    if (!res.ok) {
+      const body = await res.text()
+      throw new RcHttpError(`GET ${url.pathname} failed (${res.status}): ${body}`, res.status)
+    }
+    return res.json()
+  }
+}
+
+async function fetchAllPages(
+  serverUrl: string,
+  accessToken: string,
+  path: string,
+  params: Record<string, string>,
+  onStatus?: StatusCallback,
+): Promise<RcRecord[]> {
   const records: RcRecord[] = []
   let page = 1
   for (;;) {
@@ -16,13 +64,7 @@ async function fetchAllPages(serverUrl: string, accessToken: string, path: strin
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value)
     url.searchParams.set('perPage', '1000')
     url.searchParams.set('page', String(page))
-
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } })
-    if (!res.ok) {
-      const body = await res.text()
-      throw new Error(`GET ${path} failed (${res.status}): ${body}`)
-    }
-    const data = await res.json()
+    const data = await rcGet(url, accessToken, onStatus)
     const pageRecords: RcRecord[] = data.records ?? []
     records.push(...pageRecords)
     if (pageRecords.length === 0 || !data.navigation?.nextPage) break
@@ -31,9 +73,29 @@ async function fetchAllPages(serverUrl: string, accessToken: string, path: strin
   return records
 }
 
-function mapCallRecord(record: RcRecord, deptMap: DepartmentMap): CallRecord {
-  const extensionNumber = record.extension?.extensionNumber ?? ''
-  const recorded = Boolean(record.recording)
+async function session() {
+  const config = loadConnectionConfig()
+  if (!config) throw new Error('Not signed in to RingCentral.')
+  const accessToken = await getValidAccessToken()
+  return { serverUrl: config.serverUrl, accessToken }
+}
+
+const isPermissionDenied = (e: unknown) => e instanceof RcHttpError && e.status === 403
+
+export async function fetchCurrentUser(): Promise<RcUser> {
+  const { serverUrl, accessToken } = await session()
+  const me = await rcGet(new URL(`${serverUrl}/restapi/v1.0/account/~/extension/~`), accessToken)
+  return {
+    name: me.name || [me.contact?.firstName, me.contact?.lastName].filter(Boolean).join(' ') || 'RingCentral user',
+    extensionNumber: me.extensionNumber ?? '',
+    email: me.contact?.email ?? '',
+    isAdmin: Boolean(me.permissions?.admin?.enabled),
+  }
+}
+
+function mapCallRecord(record: RcRecord, deptMap: DepartmentMap, fallbackExt?: RcRecord): CallRecord {
+  const ext = record.extension ?? fallbackExt
+  const extensionNumber = ext?.extensionNumber ?? ''
   return {
     callId: record.id,
     startTime: new Date(record.startTime),
@@ -43,11 +105,11 @@ function mapCallRecord(record: RcRecord, deptMap: DepartmentMap): CallRecord {
     toName: record.to?.name ?? '',
     toNumber: record.to?.phoneNumber ?? record.to?.extensionNumber ?? '',
     extension: extensionNumber,
-    extensionName: record.extension?.name ?? record.to?.name ?? record.from?.name ?? 'Unassigned',
+    extensionName: ext?.name ?? record.to?.name ?? record.from?.name ?? 'Unassigned',
     department: departmentFor(deptMap, extensionNumber),
     durationSeconds: record.duration ?? 0,
     result: record.result ?? 'Unknown',
-    recorded,
+    recorded: Boolean(record.recording),
   }
 }
 
@@ -65,51 +127,64 @@ function mapSmsRecord(record: RcRecord, extension: RcRecord, deptMap: Department
   }
 }
 
-export async function syncCallLog(deptMap: DepartmentMap, days: number): Promise<CallRecord[]> {
-  const config = loadConnectionConfig()
-  if (!config) throw new Error('Not connected to RingCentral.')
-  const accessToken = await getValidAccessToken()
+function windowParams(days: number) {
+  return { dateFrom: new Date(Date.now() - days * 86400000).toISOString(), dateTo: new Date().toISOString() }
+}
 
-  const dateFrom = new Date(Date.now() - days * 86400000).toISOString()
-  const dateTo = new Date().toISOString()
-  const records = await fetchAllPages(config.serverUrl, accessToken, '/restapi/v1.0/account/~/call-log', {
-    view: 'Detailed',
-    dateFrom,
-    dateTo,
-  })
-  return records.map((r) => mapCallRecord(r, deptMap))
+export interface CallSyncResult {
+  records: CallRecord[]
+  scope: DataScope
+}
+
+export async function syncCallLog(deptMap: DepartmentMap, days: number, onStatus?: StatusCallback): Promise<CallSyncResult> {
+  const { serverUrl, accessToken } = await session()
+  const params = { view: 'Detailed', ...windowParams(days) }
+  onStatus?.('Importing call log…')
+  try {
+    const records = await fetchAllPages(serverUrl, accessToken, '/restapi/v1.0/account/~/call-log', params, onStatus)
+    return { records: records.map((r) => mapCallRecord(r, deptMap)), scope: 'company' }
+  } catch (e) {
+    if (!isPermissionDenied(e)) throw e
+    // Not an admin: RingCentral only allows this user's own call log.
+    const me = await rcGet(new URL(`${serverUrl}/restapi/v1.0/account/~/extension/~`), accessToken)
+    const records = await fetchAllPages(serverUrl, accessToken, '/restapi/v1.0/account/~/extension/~/call-log', params, onStatus)
+    return { records: records.map((r) => mapCallRecord(r, deptMap, me)), scope: 'self' }
+  }
 }
 
 export interface SmsSyncResult {
   records: SmsRecord[]
   skippedExtensions: number
+  scope: DataScope
 }
 
-export async function syncSms(deptMap: DepartmentMap, days: number): Promise<SmsSyncResult> {
-  const config = loadConnectionConfig()
-  if (!config) throw new Error('Not connected to RingCentral.')
-  const accessToken = await getValidAccessToken()
+export async function syncSms(deptMap: DepartmentMap, days: number, onStatus?: StatusCallback): Promise<SmsSyncResult> {
+  const { serverUrl, accessToken } = await session()
+  const params = { messageType: 'SMS', ...windowParams(days) }
 
-  const dateFrom = new Date(Date.now() - days * 86400000).toISOString()
-  const dateTo = new Date().toISOString()
-
-  const extensions = (await fetchAllPages(config.serverUrl, accessToken, '/restapi/v1.0/account/~/extension', { status: 'Enabled' })).filter(
-    (e) => e.type === 'User',
-  )
+  let extensions: RcRecord[]
+  let scope: DataScope = 'company'
+  try {
+    extensions = (await fetchAllPages(serverUrl, accessToken, '/restapi/v1.0/account/~/extension', { status: 'Enabled' }, onStatus)).filter(
+      (e) => e.type === 'User',
+    )
+  } catch (e) {
+    if (!isPermissionDenied(e)) throw e
+    const me = await rcGet(new URL(`${serverUrl}/restapi/v1.0/account/~/extension/~`), accessToken)
+    extensions = [{ ...me, id: '~' }]
+    scope = 'self'
+  }
 
   const records: SmsRecord[] = []
   let skippedExtensions = 0
-  for (const ext of extensions) {
+  for (const [i, ext] of extensions.entries()) {
+    if (extensions.length > 1) onStatus?.(`Importing SMS (${i + 1} of ${extensions.length} users)…`)
     try {
-      const messages = await fetchAllPages(config.serverUrl, accessToken, `/restapi/v1.0/account/~/extension/${ext.id}/message-store`, {
-        messageType: 'SMS',
-        dateFrom,
-        dateTo,
-      })
+      const messages = await fetchAllPages(serverUrl, accessToken, `/restapi/v1.0/account/~/extension/${ext.id}/message-store`, params, onStatus)
       for (const m of messages) records.push(mapSmsRecord(m, ext, deptMap))
     } catch {
       skippedExtensions += 1
     }
   }
-  return { records, skippedExtensions }
+  return { records, skippedExtensions, scope }
 }

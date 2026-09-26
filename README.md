@@ -90,28 +90,49 @@ This sync only touches the repo's own sample data files. If someone uploads a
 CSV through the dashboard's "Upload data" button, that file lives only in
 their browser and is never affected by this sync.
 
-## On-demand connect from the dashboard (Settings tab)
+## Sign in with RingCentral (Settings tab)
 
-There's also a **Settings** tab in the dashboard itself for pulling fresh data
-into your own browser session on demand, rather than waiting for the scheduled
-sync. It offers two ways to sign in:
+The header shows **Sign in to RingCentral** on every tab. It opens the
+Settings tab, whose **Sign in with RingCentral** button sends you to
+RingCentral's own login page to enter your RingCentral username and password
+(the dashboard never sees the password), then brings you back signed in. It
+uses OAuth **Authorization Code + PKCE**, the flow RingCentral provides for
+browser apps, so no client secret is involved.
 
-- **Option A — credentials file.** Pick the same credentials JSON used for the
-  scheduled sync (from a JWT-flow app). The dashboard authenticates with it
-  directly from the browser and imports call log + SMS data. By default the
-  file is held in memory only and forgotten when the tab closes; a "remember
-  on this browser" checkbox saves it to local storage instead — treat that
-  like saving a password in the browser, and don't use it on a shared machine.
-- **Option B — sign in with RingCentral.** Uses the OAuth **Authorization Code
-  + PKCE** flow built for browser apps: no secret is ever entered or stored,
-  only a Client ID. This needs a *separate* app registration ("public /
-  browser-based client"). The Settings tab shows the exact redirect URI to
-  register on it.
+- **After signing in**, your last 30 days of call log and SMS import
+  automatically. The header shows `Live · <your name>`. Settings shows who is
+  signed in, lets you re-import 7/30/90 days, and has **Sign out** (which also
+  revokes the session with RingCentral).
+- **Staying signed in**: the session is kept in this browser and data
+  re-imports each time the dashboard opens, until you sign out.
+- **Admins vs. everyone else**: RingCentral admins get company-wide data.
+  Anyone else is shown their own calls and messages, with a note explaining
+  why, rather than an error.
+- **Rate limits**: if RingCentral answers "too many requests", the import
+  waits and retries.
 
-Both options make the RingCentral API calls straight from the browser. If
-RingCentral ever refuses cross-origin requests for your app type, the
-scheduled GitHub Actions sync does the identical import server-side and is
-unaffected.
+**One-time setup (a RingCentral admin, once):** in the RingCentral Developer
+Console create a REST API app that uses the authorization-code flow as a
+client-side / browser app (PKCE, no client secret). Add the redirect URI
+shown in Settings (for the live site it's
+`https://srs1610.github.io/Ringcentral-Dashboard/`), grant Read Accounts,
+Read Call Log and Read Messages, and copy the app's **Client ID**. Put that
+Client ID in `public/ringcentral-app.json` so everyone just sees the sign-in
+button. Or enter it once in Settings, and that browser remembers it. The
+Client ID is not a secret, since it's sent to every browser that signs in.
+
+**Alternative: credentials file.** Under "Or use a credentials file instead",
+you can pick the same credentials JSON used by the scheduled sync (from a
+JWT-flow app) to sign in without RingCentral's login page. By default the
+file is held in memory only and forgotten when the tab closes. The
+"remember on this browser" checkbox saves it in local storage instead; treat
+that like saving a password, and avoid it on shared machines.
+
+Both methods call RingCentral straight from the browser. Note that every
+GitHub Pages project site under `srs1610.github.io` shares one browser origin
+and so shares local storage. Only host sites you trust there. If RingCentral
+ever refuses cross-origin requests for your app type, the scheduled GitHub
+Actions sync does the same import server-side and is unaffected.
 
 **Important scope limitation:** because this dashboard has no backend, the
 connection lives only in the browser that made it — local storage, not shared

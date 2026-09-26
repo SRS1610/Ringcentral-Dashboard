@@ -18,10 +18,47 @@ const CONFIG_KEY = 'rc_dashboard_connection_config'
 const TOKENS_KEY = 'rc_dashboard_tokens'
 const PENDING_KEY = 'rc_dashboard_oauth_pending'
 const JWT_CREDS_KEY = 'rc_dashboard_jwt_credentials'
+const REMEMBERED_APP_KEY = 'rc_dashboard_app_client'
 
 export const RC_SERVER_URLS = {
   production: 'https://platform.ringcentral.com',
   sandbox: 'https://platform.devtest.ringcentral.com',
+}
+
+// ---- Which RingCentral app "Sign in with RingCentral" uses --------------------
+// A PKCE app's Client ID is public (it ships in every browser that signs in), so it
+// can live in the site itself (public/ringcentral-app.json) or be entered once in
+// Settings and remembered per browser.
+
+export interface RcAppConfig extends RcConnectionConfig {
+  source: 'site' | 'browser'
+}
+
+export async function loadSiteAppConfig(): Promise<RcAppConfig | null> {
+  try {
+    const res = await fetch(`${import.meta.env.BASE_URL}ringcentral-app.json`, { cache: 'no-cache' })
+    if (!res.ok) return null
+    const data = (await res.json()) as { clientId?: string; environment?: string }
+    const clientId = data.clientId?.trim()
+    if (!clientId) return null
+    const serverUrl = data.environment === 'sandbox' ? RC_SERVER_URLS.sandbox : RC_SERVER_URLS.production
+    return { clientId, serverUrl, source: 'site' }
+  } catch {
+    return null
+  }
+}
+
+export function loadRememberedApp(): RcAppConfig | null {
+  const stored = readJson<RcConnectionConfig>(REMEMBERED_APP_KEY)
+  return stored?.clientId ? { ...stored, source: 'browser' } : null
+}
+
+export function rememberApp(config: RcConnectionConfig): void {
+  safeSet(REMEMBERED_APP_KEY, JSON.stringify({ clientId: config.clientId, serverUrl: config.serverUrl }))
+}
+
+export function forgetRememberedApp(): void {
+  safeRemove(REMEMBERED_APP_KEY)
 }
 
 function safeGet(key: string): string | null {
@@ -270,6 +307,33 @@ export function clearConnection(): void {
   safeRemove(TOKENS_KEY)
   safeRemove(CONFIG_KEY)
   safeRemove(PENDING_KEY)
+}
+
+/** Best-effort server-side revoke so a signed-out session can't be reused, then clears local state. */
+export async function signOutAndRevoke(): Promise<void> {
+  try {
+    const jwt = loadJwtCredentials()
+    if (jwt && jwtAccessToken) {
+      await fetch(`${jwt.serverUrl}/restapi/oauth/revoke`, {
+        method: 'POST',
+        headers: { Authorization: `Basic ${btoa(`${jwt.clientId}:${jwt.clientSecret}`)}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token: jwtAccessToken.accessToken }),
+      })
+    } else {
+      const config = loadPkceConfig()
+      const tokens = loadTokens()
+      if (config && tokens) {
+        await fetch(`${config.serverUrl}/restapi/oauth/revoke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ token: tokens.refreshToken || tokens.accessToken, client_id: config.clientId }),
+        })
+      }
+    }
+  } catch {
+    // Revocation is a courtesy; local sign-out below must happen regardless.
+  }
+  clearConnection()
 }
 
 /** Returns a valid access token for whichever connection mode is active, refreshing if needed. */

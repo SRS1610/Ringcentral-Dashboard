@@ -1,56 +1,83 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   beginConnect,
   clearConnection,
   completePendingConnect,
+  forgetRememberedApp,
   getConnectionMode,
   getValidAccessToken,
   jwtCredentialsRemembered,
   loadConnectionConfig,
+  loadRememberedApp,
+  loadSiteAppConfig,
   redirectUriForDisplay,
+  rememberApp,
   setJwtCredentials,
+  signOutAndRevoke,
   RC_SERVER_URLS,
   type ConnectionMode,
+  type RcAppConfig,
   type RcConnectionConfig,
 } from '../lib/ringcentralAuth'
 import { parseCredentialsJson } from '../lib/ringcentralCredentials'
-import { syncCallLog, syncSms } from '../lib/ringcentralApi'
+import { fetchCurrentUser, syncCallLog, syncSms, type DataScope, type RcUser } from '../lib/ringcentralApi'
 import { loadDepartmentMap, saveDepartmentMap, type DepartmentMap } from '../lib/departmentMap'
 import { useData } from './DataContext'
 
+const AUTO_SYNC_DAYS = 30
+
 interface RingCentralContextValue {
+  ready: boolean
   connected: boolean
   mode: ConnectionMode | null
   remembered: boolean
   config: RcConnectionConfig | null
+  user: RcUser | null
+  scope: DataScope | null
+  appConfig: RcAppConfig | null
   connecting: boolean
   syncing: boolean
+  syncStatus: string | null
   lastSyncedAt: Date | null
   lastError: string | null
   smsSkipped: number | null
   redirectUri: string
   departmentMap: DepartmentMap
-  connect: (config: RcConnectionConfig) => Promise<void>
+  signIn: (appOverride?: RcConnectionConfig) => Promise<void>
+  changeApp: () => void
   connectWithCredentialsFile: (file: File, remember: boolean) => Promise<void>
-  disconnect: () => void
+  signOut: () => Promise<void>
   syncNow: (days: number) => Promise<void>
   updateDepartmentMap: (map: DepartmentMap) => void
 }
 
 const RingCentralContext = createContext<RingCentralContextValue | null>(null)
 
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
 export function RingCentralProvider({ children }: { children: ReactNode }) {
   const { setCallsFromRingCentral, setSmsFromRingCentral } = useData()
+  const [ready, setReady] = useState(false)
   const [connected, setConnected] = useState(false)
   const [mode, setMode] = useState<ConnectionMode | null>(null)
   const [remembered, setRemembered] = useState(false)
   const [config, setConfig] = useState<RcConnectionConfig | null>(null)
+  const [user, setUser] = useState<RcUser | null>(null)
+  const [scope, setScope] = useState<DataScope | null>(null)
+  const [siteApp, setSiteApp] = useState<RcAppConfig | null>(null)
+  const [appConfig, setAppConfig] = useState<RcAppConfig | null>(() => loadRememberedApp())
   const [connecting, setConnecting] = useState(false)
   const [syncing, setSyncing] = useState(false)
+  const [syncStatus, setSyncStatus] = useState<string | null>(null)
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null)
   const [lastError, setLastError] = useState<string | null>(null)
   const [smsSkipped, setSmsSkipped] = useState<number | null>(null)
   const [departmentMap, setDepartmentMap] = useState<DepartmentMap>(() => loadDepartmentMap())
+  // A ref so syncs started from long-lived callbacks always use the latest mapping.
+  const deptRef = useRef(departmentMap)
+  useEffect(() => {
+    deptRef.current = departmentMap
+  }, [departmentMap])
 
   const refreshConnectionState = useCallback(() => {
     const nextMode = getConnectionMode()
@@ -58,88 +85,130 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
     setConnected(nextMode !== null)
     setConfig(loadConnectionConfig())
     setRemembered(nextMode === 'jwt' ? jwtCredentialsRemembered() : nextMode === 'pkce')
+    return nextMode !== null
   }, [])
 
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      const result = await completePendingConnect()
-      if (cancelled) return
-      if (result && !result.ok) setLastError(result.error)
-      refreshConnectionState()
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [refreshConnectionState])
+  const syncNow = useCallback(
+    async (days: number) => {
+      setSyncing(true)
+      setLastError(null)
+      const errors: string[] = []
+      let anySucceeded = false
+      const scopes: DataScope[] = []
 
-  const connect = useCallback(async (nextConfig: RcConnectionConfig) => {
-    setConnecting(true)
-    setLastError(null)
+      // Sequential on purpose: RingCentral rate-limits the call-log API, so don't double the load.
+      try {
+        const calls = await syncCallLog(deptRef.current, days, setSyncStatus)
+        setCallsFromRingCentral(calls.records, `RingCentral (last ${days}d)`)
+        scopes.push(calls.scope)
+        anySucceeded = true
+      } catch (e) {
+        errors.push(`Call log: ${message(e)}`)
+      }
+      try {
+        const sms = await syncSms(deptRef.current, days, setSyncStatus)
+        setSmsFromRingCentral(sms.records, `RingCentral (last ${days}d)`)
+        setSmsSkipped(sms.skippedExtensions)
+        scopes.push(sms.scope)
+        anySucceeded = true
+      } catch (e) {
+        errors.push(`SMS: ${message(e)}`)
+      }
+
+      if (scopes.length > 0) setScope(scopes.includes('self') ? 'self' : 'company')
+      if (errors.length > 0) setLastError(errors.join(' | '))
+      if (anySucceeded) setLastSyncedAt(new Date())
+      setSyncStatus(null)
+      setSyncing(false)
+    },
+    [setCallsFromRingCentral, setSmsFromRingCentral],
+  )
+
+  const afterSignIn = useCallback(async () => {
     try {
-      await beginConnect(nextConfig)
-      // Navigation away happens here; this promise never really resolves in-page.
-    } catch (e) {
-      setConnecting(false)
-      setLastError(e instanceof Error ? e.message : 'Failed to start connection')
+      setUser(await fetchCurrentUser())
+    } catch {
+      // Profile is cosmetic; the import below reports any real access problem.
     }
-  }, [])
+    await syncNow(AUTO_SYNC_DAYS)
+  }, [syncNow])
+
+  const started = useRef(false)
+  useEffect(() => {
+    if (started.current) return
+    started.current = true
+    ;(async () => {
+      const site = await loadSiteAppConfig()
+      setSiteApp(site)
+      setAppConfig(site ?? loadRememberedApp())
+
+      const result = await completePendingConnect()
+      if (result && !result.ok) setLastError(`Sign-in didn't complete: ${result.error}`)
+      const isIn = refreshConnectionState()
+      setReady(true)
+      if (isIn) await afterSignIn()
+    })()
+  }, [refreshConnectionState, afterSignIn])
+
+  const signIn = useCallback(
+    async (appOverride?: RcConnectionConfig) => {
+      const app = appOverride ?? appConfig
+      if (!app) {
+        setLastError('Enter your RingCentral app Client ID first (one-time setup).')
+        return
+      }
+      if (appOverride) {
+        rememberApp(appOverride)
+        setAppConfig({ ...appOverride, source: 'browser' })
+      }
+      setConnecting(true)
+      setLastError(null)
+      try {
+        await beginConnect(app)
+        // Navigates to RingCentral's login page; nothing after this runs in-page.
+      } catch (e) {
+        setConnecting(false)
+        setLastError(`Couldn't start sign-in: ${message(e)}`)
+      }
+    },
+    [appConfig],
+  )
+
+  const changeApp = useCallback(() => {
+    forgetRememberedApp()
+    setAppConfig(siteApp)
+  }, [siteApp])
 
   const connectWithCredentialsFile = useCallback(
     async (file: File, remember: boolean) => {
       setConnecting(true)
       setLastError(null)
       try {
-        const text = await file.text()
-        const creds = parseCredentialsJson(text, RC_SERVER_URLS.production)
+        const creds = parseCredentialsJson(await file.text(), RC_SERVER_URLS.production)
         setJwtCredentials(creds, remember)
-        // Prove the credentials work before reporting "connected".
-        await getValidAccessToken()
+        await getValidAccessToken() // prove the credentials before reporting "signed in"
         refreshConnectionState()
+        setConnecting(false)
+        await afterSignIn()
       } catch (e) {
         clearConnection()
         refreshConnectionState()
-        setLastError(e instanceof Error ? e.message : 'Failed to sign in with that file')
-      } finally {
+        setLastError(message(e))
         setConnecting(false)
       }
     },
-    [refreshConnectionState],
+    [refreshConnectionState, afterSignIn],
   )
 
-  const disconnect = useCallback(() => {
-    clearConnection()
+  const signOut = useCallback(async () => {
+    await signOutAndRevoke()
     refreshConnectionState()
+    setUser(null)
+    setScope(null)
     setLastSyncedAt(null)
     setLastError(null)
     setSmsSkipped(null)
   }, [refreshConnectionState])
-
-  const syncNow = useCallback(
-    async (days: number) => {
-      setSyncing(true)
-      setLastError(null)
-      const [callsResult, smsResult] = await Promise.allSettled([syncCallLog(departmentMap, days), syncSms(departmentMap, days)])
-
-      const errors: string[] = []
-      if (callsResult.status === 'fulfilled') {
-        setCallsFromRingCentral(callsResult.value, `RingCentral (last ${days}d)`)
-      } else {
-        errors.push(`Call log: ${callsResult.reason instanceof Error ? callsResult.reason.message : String(callsResult.reason)}`)
-      }
-      if (smsResult.status === 'fulfilled') {
-        setSmsFromRingCentral(smsResult.value.records, `RingCentral (last ${days}d)`)
-        setSmsSkipped(smsResult.value.skippedExtensions)
-      } else {
-        errors.push(`SMS: ${smsResult.reason instanceof Error ? smsResult.reason.message : String(smsResult.reason)}`)
-      }
-
-      if (errors.length > 0) setLastError(errors.join(' | '))
-      if (callsResult.status === 'fulfilled' || smsResult.status === 'fulfilled') setLastSyncedAt(new Date())
-      setSyncing(false)
-    },
-    [departmentMap, setCallsFromRingCentral, setSmsFromRingCentral],
-  )
 
   const updateDepartmentMap = useCallback((map: DepartmentMap) => {
     setDepartmentMap(map)
@@ -148,37 +217,49 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<RingCentralContextValue>(
     () => ({
+      ready,
       connected,
       mode,
       remembered,
       config,
+      user,
+      scope,
+      appConfig,
       connecting,
       syncing,
+      syncStatus,
       lastSyncedAt,
       lastError,
       smsSkipped,
       redirectUri: redirectUriForDisplay(),
       departmentMap,
-      connect,
+      signIn,
+      changeApp,
       connectWithCredentialsFile,
-      disconnect,
+      signOut,
       syncNow,
       updateDepartmentMap,
     }),
     [
+      ready,
       connected,
       mode,
       remembered,
       config,
+      user,
+      scope,
+      appConfig,
       connecting,
       syncing,
+      syncStatus,
       lastSyncedAt,
       lastError,
       smsSkipped,
       departmentMap,
-      connect,
+      signIn,
+      changeApp,
       connectWithCredentialsFile,
-      disconnect,
+      signOut,
       syncNow,
       updateDepartmentMap,
     ],

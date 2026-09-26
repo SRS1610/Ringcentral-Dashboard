@@ -1,0 +1,5 @@
+{
+  "_comment": "Settings for the dashboard's 'Sign in with RingCentral' button. clientId is the Client ID of a RingCentral app that uses the Authorization Code flow with PKCE (client-side web app, no client secret). It is not a secret: it's sent to every browser that signs in. Once set, nobody has to enter it in Settings. environment: 'production' or 'sandbox'.",
+  "clientId": "",
+  "environment": "production"
+}

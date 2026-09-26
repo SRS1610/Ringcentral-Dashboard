@@ -61,30 +61,38 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [sms, setSms] = useState<DatasetState<SmsRecord>>(initial<SmsRecord>())
   const [preset, setPreset] = useState<DateRangePreset>('30d')
 
-  const loadSample = useCallback(async () => {
-    setCalls((s) => ({ ...s, loading: true, error: null }))
-    setQos((s) => ({ ...s, loading: true, error: null }))
-    setSms((s) => ({ ...s, loading: true, error: null }))
+  // On first load the sample CSVs (~2.5 MB) can arrive after a RingCentral import or an
+  // upload has already landed; `replaceExisting: false` keeps that real data instead of
+  // clobbering it. The explicit "Reset to sample data" action passes true.
+  const loadSample = useCallback(async ({ replaceExisting }: { replaceExisting: boolean }) => {
+    const apply = <T,>(next: DatasetState<T>) => (prev: DatasetState<T>) => (replaceExisting || prev.source === 'sample' ? next : prev)
+    const markLoading = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'sample' ? { ...prev, loading: true, error: null } : prev)
+    setCalls(markLoading)
+    setQos(markLoading)
+    setSms(markLoading)
     try {
       const [callText, qosText, smsText] = await Promise.all([
         fetch(`${import.meta.env.BASE_URL}data/call-log-sample.csv`).then((r) => r.text()),
         fetch(`${import.meta.env.BASE_URL}data/analytics-qos-sample.csv`).then((r) => r.text()),
         fetch(`${import.meta.env.BASE_URL}data/sms-log-sample.csv`).then((r) => r.text()),
       ])
-      setCalls({ records: parseCallLogCsv(callText), source: 'sample', fileName: 'call-log-sample.csv', loading: false, error: null })
-      setQos({ records: parseQosCsv(qosText), source: 'sample', fileName: 'analytics-qos-sample.csv', loading: false, error: null })
-      setSms({ records: parseSmsCsv(smsText), source: 'sample', fileName: 'sms-log-sample.csv', loading: false, error: null })
+      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'sample', fileName: 'call-log-sample.csv', loading: false, error: null }))
+      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'sample', fileName: 'analytics-qos-sample.csv', loading: false, error: null }))
+      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'sample', fileName: 'sms-log-sample.csv', loading: false, error: null }))
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Failed to load sample data'
-      setCalls((s) => ({ ...s, loading: false, error: message }))
-      setQos((s) => ({ ...s, loading: false, error: message }))
-      setSms((s) => ({ ...s, loading: false, error: message }))
+      const fail = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'sample' ? { ...prev, loading: false, error: message } : prev)
+      setCalls(fail)
+      setQos(fail)
+      setSms(fail)
     }
   }, [])
 
   useEffect(() => {
-    loadSample()
+    loadSample({ replaceExisting: false })
   }, [loadSample])
+
+  const resetToSampleData = useCallback(() => loadSample({ replaceExisting: true }), [loadSample])
 
   const loadCallsFile = useCallback(async (file: File) => {
     setCalls((s) => ({ ...s, loading: true, error: null }))
@@ -146,7 +154,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     loadSmsFile,
     setCallsFromRingCentral,
     setSmsFromRingCentral,
-    resetToSampleData: loadSample,
+    resetToSampleData,
     range,
     preset,
     setPreset,

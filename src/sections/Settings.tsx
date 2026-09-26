@@ -4,6 +4,9 @@ import { StatusBadge } from '../components/ui/Badge'
 import { useRingCentral } from '../state/RingCentralContext'
 import { RC_SERVER_URLS } from '../lib/ringcentralAuth'
 
+const inputStyle = { border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }
+const secondaryButtonStyle = { border: '1px solid var(--border)', color: 'var(--text-secondary)' }
+
 function CopyField({ value }: { value: string }) {
   const [copied, setCopied] = useState(false)
   return (
@@ -36,225 +39,312 @@ function CopyField({ value }: { value: string }) {
 
 function ErrorBox({ message }: { message: string }) {
   return (
-    <div className="text-xs rounded-md p-2.5" style={{ background: 'var(--surface-2)', color: 'var(--status-critical)', border: '1px solid var(--border)' }}>
+    <div role="alert" className="text-xs rounded-md p-2.5" style={{ background: 'var(--surface-2)', color: 'var(--status-critical)', border: '1px solid var(--border)' }}>
       {message}
     </div>
   )
 }
 
-function ConnectionCard() {
+function Avatar({ name }: { name: string }) {
+  const initials = name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase())
+    .join('')
+  return (
+    <div
+      aria-hidden="true"
+      className="rounded-full flex items-center justify-center font-semibold text-sm shrink-0"
+      style={{ width: 40, height: 40, background: 'var(--series-1)', color: '#ffffff' }}
+    >
+      {initials || 'RC'}
+    </div>
+  )
+}
+
+function SignedInCard() {
   const rc = useRingCentral()
-  const [clientId, setClientId] = useState('')
-  const [server, setServer] = useState<'production' | 'sandbox'>('production')
   const [syncDays, setSyncDays] = useState(30)
-  const [remember, setRemember] = useState(false)
-  const [showSignIn, setShowSignIn] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-
-  if (rc.connected) {
-    const modeLabel = rc.mode === 'jwt' ? 'Signed in with a credentials file' : 'Signed in with RingCentral'
-    return (
-      <ChartCard
-        title="RingCentral connection"
-        subtitle={`${modeLabel} · ${rc.config?.serverUrl ?? ''}`}
-        action={<StatusBadge status="good" label="Connected" />}
-      >
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center gap-3 flex-wrap">
-            <label className="text-sm flex items-center gap-2" style={{ color: 'var(--text-secondary)' }}>
-              Pull last
-              <select
-                value={syncDays}
-                onChange={(e) => setSyncDays(Number(e.target.value))}
-                className="rounded-md px-2 py-1 text-sm"
-                style={{ border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }}
-              >
-                <option value={7}>7 days</option>
-                <option value={30}>30 days</option>
-                <option value={90}>90 days</option>
-              </select>
-            </label>
-            <button
-              type="button"
-              disabled={rc.syncing}
-              onClick={() => rc.syncNow(syncDays)}
-              className="text-sm font-medium rounded-lg px-3.5 py-2"
-              style={{ background: 'var(--series-1)', color: '#ffffff', opacity: rc.syncing ? 0.6 : 1 }}
-            >
-              {rc.syncing ? 'Syncing…' : 'Sync now'}
-            </button>
-            <button
-              type="button"
-              onClick={rc.disconnect}
-              className="text-sm font-medium rounded-lg px-3.5 py-2"
-              style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
-            >
-              Disconnect
-            </button>
-          </div>
-
-          <div className="text-xs flex flex-col gap-1" style={{ color: 'var(--text-muted)' }}>
-            {rc.lastSyncedAt && <span>Last synced {rc.lastSyncedAt.toLocaleString()}</span>}
-            {rc.mode === 'jwt' && !rc.remembered && <span>Credentials are held in memory only and will be cleared when you close this tab.</span>}
-            {rc.mode === 'jwt' && rc.remembered && <span>Credentials are remembered on this browser. Use Disconnect to remove them.</span>}
-            {rc.smsSkipped !== null && rc.smsSkipped > 0 && (
-              <span>{rc.smsSkipped} extension(s) skipped for SMS — likely a permissions/scope issue on that mailbox.</span>
-            )}
-          </div>
-
-          {rc.lastError && <ErrorBox message={rc.lastError} />}
-        </div>
-      </ChartCard>
-    )
-  }
+  const [signingOut, setSigningOut] = useState(false)
+  const how = rc.mode === 'jwt' ? 'Signed in with a credentials file' : 'Signed in with RingCentral'
+  const details = rc.user ? [rc.user.extensionNumber && `Ext ${rc.user.extensionNumber}`, rc.user.email].filter(Boolean).join(' · ') : ''
 
   return (
-    <ChartCard title="RingCentral connection" subtitle="Not connected" action={<StatusBadge status="neutral" label="Not connected" />}>
-      <div className="flex flex-col gap-5">
-        {rc.lastError && <ErrorBox message={rc.lastError} />}
-
-        <div className="flex flex-col gap-2">
-          <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-            Option A — Use your credentials file
-          </div>
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            Pick the JSON credentials file from your RingCentral app (the one with the JWT auth flow). The dashboard signs in with it
-            and imports your data — no other setup needed.
-          </p>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".json,application/json"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0]
-              if (file) rc.connectWithCredentialsFile(file, remember)
-              e.target.value = ''
-            }}
-          />
-          <div className="flex items-center gap-3 flex-wrap">
-            <button
-              type="button"
-              disabled={rc.connecting}
-              onClick={() => fileInputRef.current?.click()}
-              className="text-sm font-medium rounded-lg px-3.5 py-2"
-              style={{ background: 'var(--series-1)', color: '#ffffff', opacity: rc.connecting ? 0.5 : 1 }}
-            >
-              {rc.connecting ? 'Signing in…' : 'Choose credentials file'}
-            </button>
-            <label className="text-xs flex items-center gap-1.5" style={{ color: 'var(--text-secondary)' }}>
-              <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
-              Remember on this browser
-            </label>
-          </div>
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            Unchecked (recommended on shared computers): the file is used only until you close this tab. Checked: it's saved in this
-            browser's local storage so you don't need to pick it again — treat that like saving a password here.
-          </p>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setShowSignIn((v) => !v)}
-          className="text-xs self-start"
-          style={{ color: 'var(--series-1)' }}
-        >
-          {showSignIn ? 'Hide' : 'Show'} Option B — Sign in with RingCentral (public app, no file)
-        </button>
-
-        {showSignIn && (
-          <div className="flex flex-col gap-4 pt-2" style={{ borderTop: '1px solid var(--border)' }}>
-        <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
-            Client ID
-          </label>
-          <input
-            value={clientId}
-            onChange={(e) => setClientId(e.target.value)}
-            placeholder="From your RingCentral public/browser-based app"
-            className="text-sm rounded-md px-3 py-2"
-            style={{ border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }}
-          />
-        </div>
-
-        <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
-            Environment
-          </label>
-          <div className="inline-flex rounded-lg border p-0.5 self-start" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
-            {(['production', 'sandbox'] as const).map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setServer(s)}
-                className="px-3 py-1.5 text-sm rounded-md font-medium capitalize"
-                style={{ background: server === s ? 'var(--series-1)' : 'transparent', color: server === s ? '#ffffff' : 'var(--text-secondary)' }}
-              >
-                {s}
-              </button>
-            ))}
+    <ChartCard title="RingCentral account" subtitle={`${how} · ${rc.config?.serverUrl ?? ''}`} action={<StatusBadge status="good" label="Signed in" />}>
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center gap-3">
+          <Avatar name={rc.user?.name ?? ''} />
+          <div className="min-w-0">
+            <div className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+              {rc.user?.name ?? 'RingCentral account'}
+            </div>
+            {details && (
+              <div className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
+                {details}
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="flex flex-col gap-1.5">
-          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
-            Redirect URI to register on the app
-          </span>
-          <CopyField value={rc.redirectUri} />
-        </div>
-
-        <button
-          type="button"
-          disabled={!clientId.trim() || rc.connecting}
-          onClick={() => rc.connect({ clientId: clientId.trim(), serverUrl: RC_SERVER_URLS[server] })}
-          className="text-sm font-medium rounded-lg px-3.5 py-2 self-start"
-          style={{ background: 'var(--series-1)', color: '#ffffff', opacity: !clientId.trim() || rc.connecting ? 0.5 : 1 }}
-        >
-          {rc.connecting ? 'Redirecting…' : 'Connect to RingCentral'}
-        </button>
+        {rc.scope === 'self' && (
+          <div className="text-xs rounded-md p-2.5" style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
+            Showing only <strong>your own</strong> calls and messages. Company-wide data needs a RingCentral <strong>admin</strong> account to sign
+            in (or the credentials-file option set up by an admin).
           </div>
         )}
+        {rc.scope === 'company' && (
+          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Company-wide data (admin access).
+          </div>
+        )}
+
+        <div className="flex items-center gap-3 flex-wrap">
+          <label className="text-sm flex items-center gap-2" style={{ color: 'var(--text-secondary)' }}>
+            Import last
+            <select value={syncDays} onChange={(e) => setSyncDays(Number(e.target.value))} className="rounded-md px-2 py-1 text-sm" style={inputStyle}>
+              <option value={7}>7 days</option>
+              <option value={30}>30 days</option>
+              <option value={90}>90 days</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            disabled={rc.syncing}
+            onClick={() => rc.syncNow(syncDays)}
+            className="text-sm font-medium rounded-lg px-3.5 py-2"
+            style={{ background: 'var(--series-1)', color: '#ffffff', opacity: rc.syncing ? 0.6 : 1 }}
+          >
+            {rc.syncing ? 'Importing…' : 'Sync now'}
+          </button>
+          <button
+            type="button"
+            disabled={signingOut}
+            onClick={async () => {
+              setSigningOut(true)
+              await rc.signOut()
+              setSigningOut(false)
+            }}
+            className="text-sm font-medium rounded-lg px-3.5 py-2"
+            style={secondaryButtonStyle}
+          >
+            {signingOut ? 'Signing out…' : 'Sign out'}
+          </button>
+        </div>
+
+        <div className="text-xs flex flex-col gap-1" style={{ color: 'var(--text-muted)' }}>
+          {rc.syncing && rc.syncStatus && <span>{rc.syncStatus}</span>}
+          {rc.lastSyncedAt && <span>Last imported {rc.lastSyncedAt.toLocaleString()}</span>}
+          {rc.mode === 'pkce' && <span>You'll stay signed in on this browser until you sign out.</span>}
+          {rc.mode === 'jwt' && !rc.remembered && <span>Credentials are held in memory only and will be cleared when you close this tab.</span>}
+          {rc.mode === 'jwt' && rc.remembered && <span>Credentials are remembered on this browser. Sign out to remove them.</span>}
+          {rc.smsSkipped !== null && rc.smsSkipped > 0 && <span>{rc.smsSkipped} user(s) skipped for SMS — likely a permissions/scope issue on that mailbox.</span>}
+        </div>
+
+        {rc.lastError && <ErrorBox message={rc.lastError} />}
       </div>
     </ChartCard>
   )
 }
 
-function SetupGuide() {
+function CredentialsFileOption() {
+  const rc = useRingCentral()
+  const [remember, setRemember] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   return (
-    <ChartCard title="One-time app setup" subtitle="Only needed the first time you connect">
+    <div className="flex flex-col gap-2">
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        Pick the JSON credentials file from a RingCentral app that uses the JWT auth flow. The dashboard signs in with it and imports your
+        data.
+      </p>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json,application/json"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0]
+          if (file) rc.connectWithCredentialsFile(file, remember)
+          e.target.value = ''
+        }}
+      />
+      <div className="flex items-center gap-3 flex-wrap">
+        <button
+          type="button"
+          disabled={rc.connecting}
+          onClick={() => fileInputRef.current?.click()}
+          className="text-sm font-medium rounded-lg px-3.5 py-2"
+          style={{ ...secondaryButtonStyle, color: 'var(--text-primary)', opacity: rc.connecting ? 0.5 : 1 }}
+        >
+          Choose credentials file
+        </button>
+        <label className="text-xs flex items-center gap-1.5" style={{ color: 'var(--text-secondary)' }}>
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+          Remember on this browser
+        </label>
+      </div>
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        Unchecked (recommended on shared computers): the file is used only until you close this tab. Checked: it's saved in this browser —
+        treat that like saving a password here.
+      </p>
+    </div>
+  )
+}
+
+function SignInCard() {
+  const rc = useRingCentral()
+  const [clientId, setClientId] = useState('')
+  const [server, setServer] = useState<'production' | 'sandbox'>('production')
+  const [showFile, setShowFile] = useState(false)
+  const needsApp = !rc.appConfig
+  const canSignIn = !rc.connecting && (!needsApp || clientId.trim() !== '')
+
+  const onSignIn = () => {
+    if (needsApp) rc.signIn({ clientId: clientId.trim(), serverUrl: RC_SERVER_URLS[server] })
+    else rc.signIn()
+  }
+
+  return (
+    <ChartCard title="Sign in to RingCentral" subtitle="Import your call and messaging data" action={<StatusBadge status="neutral" label="Not signed in" />}>
+      <div className="flex flex-col gap-5">
+        {rc.lastError && <ErrorBox message={rc.lastError} />}
+
+        {needsApp && (
+          <div className="flex flex-col gap-3 rounded-lg p-3.5" style={{ border: '1px dashed var(--border)', background: 'var(--surface-2)' }}>
+            <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+              One-time setup: your RingCentral app
+            </div>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              Sign-in needs the Client ID of your organization's RingCentral app (see "One-time app setup" below). Enter it once; this browser
+              remembers it. To skip this step for everyone, put it in <code>public/ringcentral-app.json</code>.
+            </p>
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="rc-client-id" className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+                App Client ID
+              </label>
+              <input
+                id="rc-client-id"
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="e.g. AbCdEf123456"
+                className="text-sm rounded-md px-3 py-2"
+                style={{ ...inputStyle, background: 'var(--surface-1)' }}
+              />
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+                Environment
+              </span>
+              <div className="inline-flex rounded-lg border p-0.5" style={{ borderColor: 'var(--border)', background: 'var(--surface-1)' }}>
+                {(['production', 'sandbox'] as const).map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setServer(s)}
+                    className="px-2.5 py-1 text-xs rounded-md font-medium capitalize"
+                    style={{ background: server === s ? 'var(--series-1)' : 'transparent', color: server === s ? '#ffffff' : 'var(--text-secondary)' }}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            disabled={!canSignIn}
+            onClick={onSignIn}
+            className="text-base font-semibold rounded-lg px-5 py-3 self-start"
+            style={{ background: 'var(--series-1)', color: '#ffffff', opacity: canSignIn ? 1 : 0.5, cursor: canSignIn ? 'pointer' : 'not-allowed' }}
+          >
+            {rc.connecting ? 'Opening RingCentral…' : 'Sign in with RingCentral'}
+          </button>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            You'll enter your RingCentral username and password on RingCentral's own secure login page — this dashboard never sees your
+            password. When you come back, your last {30} days of data import automatically.
+          </p>
+          {rc.appConfig?.source === 'browser' && (
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              Using RingCentral app …{rc.appConfig.clientId.slice(-4)} ({rc.appConfig.serverUrl.includes('devtest') ? 'sandbox' : 'production'}).{' '}
+              <button type="button" onClick={rc.changeApp} className="underline" style={{ color: 'var(--series-1)' }}>
+                Change
+              </button>
+            </p>
+          )}
+        </div>
+
+        <div className="flex flex-col gap-3 pt-3" style={{ borderTop: '1px solid var(--border)' }}>
+          <button type="button" onClick={() => setShowFile((v) => !v)} className="text-xs self-start" style={{ color: 'var(--series-1)' }} aria-expanded={showFile}>
+            {showFile ? 'Hide' : 'Or use a credentials file instead'}
+          </button>
+          {showFile && <CredentialsFileOption />}
+        </div>
+      </div>
+    </ChartCard>
+  )
+}
+
+function ConnectionCard() {
+  const rc = useRingCentral()
+  if (!rc.ready) {
+    return (
+      <ChartCard title="RingCentral account" subtitle="Checking sign-in…">
+        <div className="text-sm" style={{ color: 'var(--text-muted)' }}>
+          One moment…
+        </div>
+      </ChartCard>
+    )
+  }
+  return rc.connected ? <SignedInCard /> : <SignInCard />
+}
+
+function SetupGuide() {
+  const rc = useRingCentral()
+  return (
+    <ChartCard title="One-time app setup" subtitle="Done once by a RingCentral admin, then everyone just clicks Sign in">
       <div className="text-sm flex flex-col gap-3" style={{ color: 'var(--text-secondary)' }}>
         <div>
           <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
-            Option A — credentials file (simplest)
+            For "Sign in with RingCentral"
           </div>
-          <ol className="list-decimal pl-5 flex flex-col gap-1 mt-1">
+          <ol className="list-decimal pl-5 flex flex-col gap-1.5 mt-1">
             <li>
               In the{' '}
               <a href="https://developers.ringcentral.com/" target="_blank" rel="noreferrer" style={{ color: 'var(--series-1)' }}>
                 RingCentral Developer Console
               </a>
-              , create an app (using an <strong>admin</strong> account) with the <strong>JWT auth flow</strong> enabled, and grant it read scopes
-              for call log, messages, and extensions/accounts.
+              , create a <strong>REST API app</strong> that signs users in with the <strong>authorization code</strong> flow as a{' '}
+              <strong>client-side / browser app</strong> (PKCE — the kind with no client secret).
             </li>
-            <li>Generate a JWT credential for an admin user and download/save the credentials JSON.</li>
-            <li>Click "Choose credentials file" above and pick that JSON. That's it.</li>
+            <li>
+              Add this exact <strong>redirect URI</strong> to the app:
+              <div className="mt-1">
+                <CopyField value={rc.redirectUri} />
+              </div>
+            </li>
+            <li>
+              Grant read permissions: <strong>Read Accounts</strong>, <strong>Read Call Log</strong>, <strong>Read Messages</strong>.
+            </li>
+            <li>
+              Copy the app's <strong>Client ID</strong> into the one-time setup box above — or into <code>public/ringcentral-app.json</code> so
+              nobody has to enter it. The Client ID is not a secret.
+            </li>
           </ol>
-          <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-            The same file works for the scheduled GitHub Actions sync (see README) — that's the way to give every viewer one shared,
-            auto-refreshed dataset without anyone signing in.
+          <p className="text-xs mt-1.5" style={{ color: 'var(--text-muted)' }}>
+            Admins who sign in see company-wide data; other users see their own calls and messages.
           </p>
         </div>
         <div>
           <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
-            Option B — sign in with RingCentral (no file, no secret)
+            For the credentials-file option
           </div>
-          <ol className="list-decimal pl-5 flex flex-col gap-1 mt-1">
-            <li>
-              Create a separate app as a <strong>public / browser-based client</strong> using the <strong>Authorization Code + PKCE</strong> flow.
-            </li>
-            <li>Add the redirect URI shown in Option B to the app's allowed redirect URIs.</li>
-            <li>Grant the same read scopes, then paste the app's Client ID into Option B and click Connect.</li>
-          </ol>
+          <p className="mt-1">
+            Use an app with the <strong>JWT auth flow</strong>, generate a JWT for an admin user, and save the credentials JSON. The same file
+            powers the scheduled GitHub sync (see README), which keeps one shared dataset fresh for every viewer without anyone signing in.
+          </p>
         </div>
       </div>
     </ChartCard>
@@ -307,21 +397,16 @@ function DepartmentMapEditor() {
             onChange={(e) => setNewExt(e.target.value)}
             placeholder="Extension #"
             className="text-sm rounded-md px-2 py-1.5 w-24"
-            style={{ border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }}
+            style={inputStyle}
           />
           <input
             value={newDept}
             onChange={(e) => setNewDept(e.target.value)}
             placeholder="Department name"
             className="text-sm rounded-md px-2 py-1.5 flex-1"
-            style={{ border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }}
+            style={inputStyle}
           />
-          <button
-            type="button"
-            onClick={addRow}
-            className="text-xs font-medium rounded-md px-3 py-1.5"
-            style={{ border: '1px solid var(--border)', color: 'var(--text-primary)' }}
-          >
+          <button type="button" onClick={addRow} className="text-xs font-medium rounded-md px-3 py-1.5" style={{ border: '1px solid var(--border)', color: 'var(--text-primary)' }}>
             Add
           </button>
         </div>
@@ -333,24 +418,14 @@ function DepartmentMapEditor() {
 export function Settings() {
   return (
     <div className="flex flex-col gap-5">
-      <div
-        className="text-sm rounded-xl p-4"
-        style={{ background: 'var(--surface-1)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
-      >
-        <strong style={{ color: 'var(--text-primary)' }}>This connection is local to your browser.</strong> Your RingCentral credentials
-        stay in this browser (in memory only, unless you choose to remember them) and calls go directly from your browser to RingCentral —
-        nothing passes through a server we control. That also means connecting here only refreshes data in <em>your</em> session, not for other people
-        viewing this dashboard. For one shared, always-fresh dataset every viewer sees, use the scheduled GitHub Actions sync described in
-        the repo's README instead — this Settings page and that sync can be used together or independently.
-      </div>
-
       <ConnectionCard />
       <DepartmentMapEditor />
       <SetupGuide />
 
       <p className="text-xs text-center" style={{ color: 'var(--text-muted)' }}>
-        Service Quality / SLA metrics still come from CSV upload only — that data needs RingCentral's separate Analytics API, whose
-        availability depends on plan tier.
+        Signing in refreshes data in <em>your</em> browser only. Your sign-in stays on this device and data goes straight between your
+        browser and RingCentral. Service Quality / SLA metrics still come from CSV upload — that data needs RingCentral's separate Analytics
+        API, whose availability depends on plan tier.
       </p>
     </div>
   )
