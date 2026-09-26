@@ -186,12 +186,39 @@ export function redirectUriForDisplay(): string {
   return redirectUri()
 }
 
+/**
+ * Link that opens RingCentral's Developer Console "new app" form pre-filled for
+ * browser sign-in (RingCentral's documented `new-app` URL parameters). The admin
+ * still reviews the form and clicks Create.
+ */
+export function signInAppRegistrationUrl(): string {
+  const url = new URL('https://developer.ringcentral.com/new-app')
+  url.searchParams.set('name', 'Executive Dashboard Sign-in')
+  url.searchParams.set('desc', 'Lets users sign in to the RingCentral executive dashboard in their browser to import call log and SMS data.')
+  url.searchParams.set('public', 'false')
+  url.searchParams.set('type', 'BrowserBased')
+  url.searchParams.set('permissions', 'ReadAccounts,ReadCallLog,ReadMessages')
+  url.searchParams.set('redirectUri', redirectUri())
+  return url.toString()
+}
+
+interface PendingSignIn {
+  verifier: string
+  state: string
+  config: RcConnectionConfig
+  startedAt?: number
+  reported?: boolean
+}
+
+const PENDING_MAX_AGE_MS = 60 * 60 * 1000
+
 /** Kicks off the PKCE authorization-code flow by navigating to RingCentral's login page. */
 export async function beginConnect(config: RcConnectionConfig): Promise<void> {
   const verifier = generateCodeVerifier()
   const challenge = await generateCodeChallenge(verifier)
   const state = generateState()
-  safeSet(PENDING_KEY, JSON.stringify({ verifier, state, config }))
+  const pending: PendingSignIn = { verifier, state, config, startedAt: Date.now() }
+  safeSet(PENDING_KEY, JSON.stringify(pending))
 
   const url = new URL(`${config.serverUrl}/restapi/oauth/authorize`)
   url.searchParams.set('response_type', 'code')
@@ -225,7 +252,7 @@ export async function completePendingConnect(): Promise<{ ok: true } | { ok: fal
   if (!pendingRaw) {
     return { ok: false, error: 'No pending connection request found (was this tab reloaded mid-flow?).' }
   }
-  const pending = JSON.parse(pendingRaw) as { verifier: string; state: string; config: RcConnectionConfig }
+  const pending = JSON.parse(pendingRaw) as PendingSignIn
   if (state !== pending.state) {
     return { ok: false, error: 'State mismatch — possible CSRF or stale request. Please try connecting again.' }
   }
@@ -244,7 +271,10 @@ export async function completePendingConnect(): Promise<{ ok: true } | { ok: fal
     })
     if (!res.ok) {
       const body = await res.text()
-      return { ok: false, error: `Token exchange failed (${res.status}): ${body}` }
+      const hint = /invalid_client|unauthorized_client/i.test(body)
+        ? ' Browser sign-in needs a RingCentral app of type "Client-side web app" (authorization code flow, no client secret).'
+        : ''
+      return { ok: false, error: `Token exchange failed (${res.status}): ${body}${hint}` }
     }
     const data = await res.json()
     clearJwtCredentials()
@@ -258,6 +288,28 @@ export async function completePendingConnect(): Promise<{ ok: true } | { ok: fal
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'Token exchange failed' }
   }
+}
+
+/**
+ * When RingCentral rejects the sign-in request itself (e.g. OAU-113 "No redirect URI is
+ * registered for this client application"), it shows its own error page and never
+ * redirects back, so the user returns by hand with no `code` or `error` in the URL.
+ * Detects that from the leftover pending request and returns the app that was used,
+ * once per attempt. The pending request is kept in case another tab is still mid-flow.
+ */
+export function takeAbandonedSignIn(): RcConnectionConfig | null {
+  const params = new URLSearchParams(window.location.search)
+  if (params.has('code') || params.has('error')) return null
+  const pending = readJson<PendingSignIn>(PENDING_KEY)
+  if (!pending) return null
+  // No startedAt: written by an older version of the dashboard; still worth explaining once.
+  if (pending.startedAt && Date.now() - pending.startedAt > PENDING_MAX_AGE_MS) {
+    safeRemove(PENDING_KEY)
+    return null
+  }
+  if (pending.reported) return null
+  safeSet(PENDING_KEY, JSON.stringify({ ...pending, reported: true }))
+  return pending.config
 }
 
 async function refreshPkceToken(config: RcConnectionConfig, tokens: RcTokens): Promise<string> {

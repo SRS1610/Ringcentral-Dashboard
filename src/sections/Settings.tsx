@@ -63,6 +63,75 @@ function Avatar({ name }: { name: string }) {
   )
 }
 
+/** The steps for creating the browser sign-in app; shared by the setup guide and the "sign-in rejected" help. */
+function AppSetupSteps() {
+  const rc = useRingCentral()
+  return (
+    <ol className="list-decimal pl-5 flex flex-col gap-1.5 mt-1">
+      <li>
+        In the{' '}
+        <a href="https://developers.ringcentral.com/" target="_blank" rel="noreferrer" style={{ color: 'var(--series-1)' }}>
+          RingCentral Developer Console
+        </a>
+        , create a <strong>new</strong> REST API app. Under Auth choose <strong>3-legged OAuth flow authorization code</strong>, then{' '}
+        <strong>Client-side web app</strong> (no client secret). Or{' '}
+        <a href={rc.appRegistrationUrl} target="_blank" rel="noreferrer" style={{ color: 'var(--series-1)' }}>
+          open the form with these settings filled in
+        </a>{' '}
+        and check them before saving.
+      </li>
+      <li>
+        Set the <strong>OAuth Redirect URI</strong> to exactly:
+        <div className="mt-1">
+          <CopyField value={rc.redirectUri} />
+        </div>
+      </li>
+      <li>
+        Grant read permissions: <strong>Read Accounts</strong>, <strong>Read Call Log</strong>, <strong>Read Messages</strong>.
+      </li>
+      <li>
+        Enter the new app's <strong>Client ID</strong> in the one-time setup box on this page, or put it in{' '}
+        <code>public/ringcentral-app.json</code> so nobody has to enter it. The Client ID is not a secret.
+      </li>
+    </ol>
+  )
+}
+
+function SignInRejectedHelp({ app }: { app: { clientId: string } }) {
+  const rc = useRingCentral()
+  return (
+    <div role="alert" className="flex flex-col gap-2 rounded-lg p-3.5 text-sm" style={{ border: '1px solid var(--status-critical)', background: 'var(--surface-2)', color: 'var(--text-secondary)' }}>
+      <div className="font-semibold" style={{ color: 'var(--status-critical)' }}>
+        Sign-in didn't finish
+      </div>
+      <p className="text-xs">
+        RingCentral didn't send you back here. If it showed <strong>"No redirect URI is registered for this client application"</strong>{' '}
+        (OAU-113) or a redirect URI mismatch, the RingCentral app with Client ID …{app.clientId.slice(-4)} isn't set up for browser sign-in.
+        This usually means it's the app from the JWT credentials file. That app is for the scheduled sync, so leave it as it is and create a
+        separate sign-in app:
+      </p>
+      <div className="text-xs">
+        <AppSetupSteps />
+      </div>
+      {rc.appConfig?.source === 'browser' && (
+        <button
+          type="button"
+          onClick={rc.changeApp}
+          className="text-sm font-medium rounded-lg px-3.5 py-2 self-start"
+          style={{ ...secondaryButtonStyle, color: 'var(--text-primary)', background: 'var(--surface-1)' }}
+        >
+          Enter the new Client ID
+        </button>
+      )}
+      {rc.appConfig?.source === 'site' && (
+        <p className="text-xs">
+          This Client ID comes from <code>public/ringcentral-app.json</code>; update it there once the sign-in app exists.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function SignedInCard() {
   const rc = useRingCentral()
   const [syncDays, setSyncDays] = useState(30)
@@ -208,6 +277,7 @@ function SignInCard() {
     <ChartCard title="Sign in to RingCentral" subtitle="Import your call and messaging data" action={<StatusBadge status="neutral" label="Not signed in" />}>
       <div className="flex flex-col gap-5">
         {rc.lastError && <ErrorBox message={rc.lastError} />}
+        {rc.abandonedApp && <SignInRejectedHelp app={rc.abandonedApp} />}
 
         {needsApp && (
           <div className="flex flex-col gap-3 rounded-lg p-3.5" style={{ border: '1px dashed var(--border)', background: 'var(--surface-2)' }}>
@@ -215,8 +285,9 @@ function SignInCard() {
               One-time setup: your RingCentral app
             </div>
             <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-              Sign-in needs the Client ID of your organization's RingCentral app (see "One-time app setup" below). Enter it once; this browser
-              remembers it. To skip this step for everyone, put it in <code>public/ringcentral-app.json</code>.
+              Sign-in needs the Client ID of your organization's RingCentral <strong>sign-in app</strong> (a "Client-side web app", see
+              "One-time app setup" below). The Client ID in your JWT credentials file won't work here. Enter it once; this browser remembers
+              it. To skip this step for everyone, put it in <code>public/ringcentral-app.json</code>.
             </p>
             <div className="flex flex-col gap-1.5">
               <label htmlFor="rc-client-id" className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
@@ -302,7 +373,6 @@ function ConnectionCard() {
 }
 
 function SetupGuide() {
-  const rc = useRingCentral()
   return (
     <ChartCard title="One-time app setup" subtitle="Done once by a RingCentral admin, then everyone just clicks Sign in">
       <div className="text-sm flex flex-col gap-3" style={{ color: 'var(--text-secondary)' }}>
@@ -310,31 +380,10 @@ function SetupGuide() {
           <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
             For "Sign in with RingCentral"
           </div>
-          <ol className="list-decimal pl-5 flex flex-col gap-1.5 mt-1">
-            <li>
-              In the{' '}
-              <a href="https://developers.ringcentral.com/" target="_blank" rel="noreferrer" style={{ color: 'var(--series-1)' }}>
-                RingCentral Developer Console
-              </a>
-              , create a <strong>REST API app</strong> that signs users in with the <strong>authorization code</strong> flow as a{' '}
-              <strong>client-side / browser app</strong> (PKCE — the kind with no client secret).
-            </li>
-            <li>
-              Add this exact <strong>redirect URI</strong> to the app:
-              <div className="mt-1">
-                <CopyField value={rc.redirectUri} />
-              </div>
-            </li>
-            <li>
-              Grant read permissions: <strong>Read Accounts</strong>, <strong>Read Call Log</strong>, <strong>Read Messages</strong>.
-            </li>
-            <li>
-              Copy the app's <strong>Client ID</strong> into the one-time setup box above — or into <code>public/ringcentral-app.json</code> so
-              nobody has to enter it. The Client ID is not a secret.
-            </li>
-          </ol>
+          <AppSetupSteps />
           <p className="text-xs mt-1.5" style={{ color: 'var(--text-muted)' }}>
-            Admins who sign in see company-wide data; other users see their own calls and messages.
+            This must be a separate app from the JWT one: a JWT app has no redirect URI, so RingCentral rejects browser sign-in with it
+            (error OAU-113). Admins who sign in see company-wide data; other users see their own calls and messages.
           </p>
         </div>
         <div>
@@ -342,7 +391,7 @@ function SetupGuide() {
             For the credentials-file option
           </div>
           <p className="mt-1">
-            Use an app with the <strong>JWT auth flow</strong>, generate a JWT for an admin user, and save the credentials JSON. The same file
+            Use an app with the <strong>JWT auth flow</strong> (your existing one), generate a JWT for an admin user, and save the credentials JSON. The same file
             powers the scheduled GitHub sync (see README), which keeps one shared dataset fresh for every viewer without anyone signing in.
           </p>
         </div>

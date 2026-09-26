@@ -13,7 +13,9 @@ import {
   redirectUriForDisplay,
   rememberApp,
   setJwtCredentials,
+  signInAppRegistrationUrl,
   signOutAndRevoke,
+  takeAbandonedSignIn,
   RC_SERVER_URLS,
   type ConnectionMode,
   type RcAppConfig,
@@ -40,8 +42,11 @@ interface RingCentralContextValue {
   syncStatus: string | null
   lastSyncedAt: Date | null
   lastError: string | null
+  /** Set when RingCentral rejected a sign-in without redirecting back (e.g. OAU-113). */
+  abandonedApp: RcConnectionConfig | null
   smsSkipped: number | null
   redirectUri: string
+  appRegistrationUrl: string
   departmentMap: DepartmentMap
   signIn: (appOverride?: RcConnectionConfig) => Promise<void>
   changeApp: () => void
@@ -71,6 +76,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
   const [syncStatus, setSyncStatus] = useState<string | null>(null)
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null)
   const [lastError, setLastError] = useState<string | null>(null)
+  const [abandonedApp, setAbandonedApp] = useState<RcConnectionConfig | null>(null)
   const [smsSkipped, setSmsSkipped] = useState<number | null>(null)
   const [departmentMap, setDepartmentMap] = useState<DepartmentMap>(() => loadDepartmentMap())
   // A ref so syncs started from long-lived callbacks always use the latest mapping.
@@ -144,11 +150,25 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
 
       const result = await completePendingConnect()
       if (result && !result.ok) setLastError(`Sign-in didn't complete: ${result.error}`)
+      if (!result) setAbandonedApp(takeAbandonedSignIn())
       const isIn = refreshConnectionState()
       setReady(true)
       if (isIn) await afterSignIn()
     })()
   }, [refreshConnectionState, afterSignIn])
+
+  // Coming "Back" from RingCentral's error page can restore this page from the
+  // back/forward cache, where the mount effect above doesn't run again.
+  useEffect(() => {
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!e.persisted) return
+      setConnecting(false)
+      const abandoned = takeAbandonedSignIn()
+      if (abandoned) setAbandonedApp(abandoned)
+    }
+    window.addEventListener('pageshow', onPageShow)
+    return () => window.removeEventListener('pageshow', onPageShow)
+  }, [])
 
   const signIn = useCallback(
     async (appOverride?: RcConnectionConfig) => {
@@ -163,6 +183,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       }
       setConnecting(true)
       setLastError(null)
+      setAbandonedApp(null)
       try {
         await beginConnect(app)
         // Navigates to RingCentral's login page; nothing after this runs in-page.
@@ -183,6 +204,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
     async (file: File, remember: boolean) => {
       setConnecting(true)
       setLastError(null)
+      setAbandonedApp(null)
       try {
         const creds = parseCredentialsJson(await file.text(), RC_SERVER_URLS.production)
         setJwtCredentials(creds, remember)
@@ -230,8 +252,10 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       syncStatus,
       lastSyncedAt,
       lastError,
+      abandonedApp,
       smsSkipped,
       redirectUri: redirectUriForDisplay(),
+      appRegistrationUrl: signInAppRegistrationUrl(),
       departmentMap,
       signIn,
       changeApp,
@@ -254,6 +278,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       syncStatus,
       lastSyncedAt,
       lastError,
+      abandonedApp,
       smsSkipped,
       departmentMap,
       signIn,

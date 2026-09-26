@@ -15,7 +15,7 @@ function RingCentralChip({ onOpenSettings }: { onOpenSettings: () => void }) {
         className="text-sm font-medium rounded-lg px-3.5 py-2 whitespace-nowrap"
         style={{ background: 'var(--series-1)', color: '#ffffff' }}
       >
-        {rc.lastError ? 'Sign-in problem — retry' : 'Sign in to RingCentral'}
+        {rc.lastError || rc.abandonedApp ? 'Sign-in problem — see Settings' : 'Sign in to RingCentral'}
       </button>
     )
   }

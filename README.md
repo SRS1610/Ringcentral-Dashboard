@@ -112,14 +112,22 @@ browser apps, so no client secret is involved.
   waits and retries.
 
 **One-time setup (a RingCentral admin, once):** in the RingCentral Developer
-Console create a REST API app that uses the authorization-code flow as a
-client-side / browser app (PKCE, no client secret). Add the redirect URI
-shown in Settings (for the live site it's
-`https://srs1610.github.io/Ringcentral-Dashboard/`), grant Read Accounts,
+Console create a **new** REST API app. Under Auth choose "3-legged OAuth flow
+authorization code", then "Client-side web app" (PKCE, no client secret).
+Settings also links to the console's new-app form with these values filled
+in. Set the OAuth Redirect URI to the one shown in Settings (for the live site
+it's `https://srs1610.github.io/Ringcentral-Dashboard/`), grant Read Accounts,
 Read Call Log and Read Messages, and copy the app's **Client ID**. Put that
 Client ID in `public/ringcentral-app.json` so everyone just sees the sign-in
 button. Or enter it once in Settings, and that browser remembers it. The
 Client ID is not a secret, since it's sent to every browser that signs in.
+
+This has to be a different app from the JWT app used by the scheduled sync
+and the credentials file. A JWT app has no redirect URI, so RingCentral
+rejects browser sign-in with it: "No redirect URI is registered for this
+client application" (OAU-113). RingCentral shows that error on its own page
+and doesn't send you back. When you return to the dashboard, Settings
+explains the fix and lets you enter the new Client ID.
 
 **Alternative: credentials file.** Under "Or use a credentials file instead",
 you can pick the same credentials JSON used by the scheduled sync (from a
