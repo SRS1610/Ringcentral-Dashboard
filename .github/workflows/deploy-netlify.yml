@@ -1,0 +1,56 @@
+name: Deploy to Netlify
+
+# Publishes the same build to https://ringcentral-performance-dashboard.netlify.app/
+# on every push. Needs one repository secret, NETLIFY_AUTH_TOKEN (a Netlify personal
+# access token); until it is added this workflow skips the deploy instead of failing.
+# To target a different Netlify project, set a repository variable NETLIFY_SITE_ID.
+
+on:
+  push:
+    branches:
+      - main
+      - claude/stoic-ptolemy-kjd4q5
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netlify
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: ${{ vars.NETLIFY_SITE_ID || 'ringcentral-performance-dashboard' }}
+    steps:
+      - name: Check for Netlify token
+        id: token
+        run: |
+          if [ -z "$NETLIFY_AUTH_TOKEN" ]; then
+            echo "::notice::NETLIFY_AUTH_TOKEN secret not set; skipping the Netlify deploy."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+      - uses: actions/setup-node@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - if: steps.token.outputs.present == 'true'
+        run: npm ci
+      # Netlify serves the site from the domain root, unlike GitHub Pages' /<repo>/ path.
+      - if: steps.token.outputs.present == 'true'
+        run: npm run build -- --base=/
+      - name: Deploy dist/ to Netlify (production)
+        if: steps.token.outputs.present == 'true'
+        run: >-
+          npx --yes netlify-cli@27.10.0 deploy
+          --prod --no-build --dir=dist
+          --site="$NETLIFY_SITE_ID"
+          --message="GitHub Actions deploy of ${GITHUB_SHA::7}"
