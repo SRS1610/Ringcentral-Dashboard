@@ -92,16 +92,26 @@ their browser and is never affected by this sync.
 
 ## On-demand connect from the dashboard (Settings tab)
 
-There's also a **Settings** tab in the dashboard itself with a "Connect to
-RingCentral" button, for pulling fresh data into your own browser session on
-demand rather than waiting for the scheduled sync. It uses RingCentral's OAuth
-**Authorization Code + PKCE** flow — the flow built for browser apps, so no
-client secret is ever entered or stored; you just need a Client ID.
+There's also a **Settings** tab in the dashboard itself for pulling fresh data
+into your own browser session on demand, rather than waiting for the scheduled
+sync. It offers two ways to sign in:
 
-This is a *different* app registration than the JWT one used for the
-scheduled sync above (different auth flow, different app type: "public /
-browser-based client" rather than "server-only"). The Settings tab itself
-walks through the setup steps and shows the exact redirect URI to register.
+- **Option A — credentials file.** Pick the same credentials JSON used for the
+  scheduled sync (from a JWT-flow app). The dashboard authenticates with it
+  directly from the browser and imports call log + SMS data. By default the
+  file is held in memory only and forgotten when the tab closes; a "remember
+  on this browser" checkbox saves it to local storage instead — treat that
+  like saving a password in the browser, and don't use it on a shared machine.
+- **Option B — sign in with RingCentral.** Uses the OAuth **Authorization Code
+  + PKCE** flow built for browser apps: no secret is ever entered or stored,
+  only a Client ID. This needs a *separate* app registration ("public /
+  browser-based client"). The Settings tab shows the exact redirect URI to
+  register on it.
+
+Both options make the RingCentral API calls straight from the browser. If
+RingCentral ever refuses cross-origin requests for your app type, the
+scheduled GitHub Actions sync does the identical import server-side and is
+unaffected.
 
 **Important scope limitation:** because this dashboard has no backend, the
 connection lives only in the browser that made it — local storage, not shared

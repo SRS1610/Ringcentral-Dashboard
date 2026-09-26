@@ -1,4 +1,5 @@
 import { generateCodeChallenge, generateCodeVerifier, generateState } from './pkce'
+import type { RcJwtCredentials } from './ringcentralCredentials'
 
 export interface RcConnectionConfig {
   clientId: string
@@ -11,9 +12,12 @@ export interface RcTokens {
   expiresAt: number // epoch ms
 }
 
+export type ConnectionMode = 'pkce' | 'jwt'
+
 const CONFIG_KEY = 'rc_dashboard_connection_config'
 const TOKENS_KEY = 'rc_dashboard_tokens'
 const PENDING_KEY = 'rc_dashboard_oauth_pending'
+const JWT_CREDS_KEY = 'rc_dashboard_jwt_credentials'
 
 export const RC_SERVER_URLS = {
   production: 'https://platform.ringcentral.com',
@@ -44,14 +48,85 @@ function safeRemove(key: string): void {
   }
 }
 
-export function loadConnectionConfig(): RcConnectionConfig | null {
-  const raw = safeGet(CONFIG_KEY)
+function readJson<T>(key: string): T | null {
+  const raw = safeGet(key)
   if (!raw) return null
   try {
-    return JSON.parse(raw)
+    return JSON.parse(raw) as T
   } catch {
     return null
   }
+}
+
+// ---- JWT credentials-file mode ---------------------------------------------
+// Credentials live in memory for the tab's lifetime; they are only written to
+// localStorage when the user explicitly opts in ("remember on this browser").
+// The short-lived access token is never persisted.
+
+let jwtCredentials: RcJwtCredentials | null = null
+let jwtAccessToken: { accessToken: string; expiresAt: number } | null = null
+
+export function setJwtCredentials(creds: RcJwtCredentials, remember: boolean): void {
+  jwtCredentials = creds
+  jwtAccessToken = null
+  if (remember) safeSet(JWT_CREDS_KEY, JSON.stringify(creds))
+  else safeRemove(JWT_CREDS_KEY)
+}
+
+export function loadJwtCredentials(): RcJwtCredentials | null {
+  if (jwtCredentials) return jwtCredentials
+  const stored = readJson<RcJwtCredentials>(JWT_CREDS_KEY)
+  if (stored) jwtCredentials = stored
+  return jwtCredentials
+}
+
+export function jwtCredentialsRemembered(): boolean {
+  return safeGet(JWT_CREDS_KEY) !== null
+}
+
+function clearJwtCredentials(): void {
+  jwtCredentials = null
+  jwtAccessToken = null
+  safeRemove(JWT_CREDS_KEY)
+}
+
+async function fetchJwtAccessToken(creds: RcJwtCredentials): Promise<string> {
+  const basic = btoa(`${creds.clientId}:${creds.clientSecret}`)
+  let res: Response
+  try {
+    res = await fetch(`${creds.serverUrl}/restapi/oauth/token`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${basic}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: creds.jwt,
+      }),
+    })
+  } catch (e) {
+    throw new Error(
+      `Couldn't reach RingCentral from the browser (${e instanceof Error ? e.message : 'network error'}). ` +
+        'If this keeps happening, the scheduled GitHub Actions sync (see README) does the same import server-side.',
+    )
+  }
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(
+      `RingCentral rejected the credentials (${res.status}): ${body}. ` +
+        'Check that the app has the JWT auth flow enabled and the JWT was issued for it.',
+    )
+  }
+  const data = await res.json()
+  jwtAccessToken = { accessToken: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 }
+  return jwtAccessToken.accessToken
+}
+
+// ---- PKCE sign-in mode ------------------------------------------------------
+
+export function loadPkceConfig(): RcConnectionConfig | null {
+  return readJson<RcConnectionConfig>(CONFIG_KEY)
 }
 
 export function saveConnectionConfig(config: RcConnectionConfig): void {
@@ -59,22 +134,11 @@ export function saveConnectionConfig(config: RcConnectionConfig): void {
 }
 
 export function loadTokens(): RcTokens | null {
-  const raw = safeGet(TOKENS_KEY)
-  if (!raw) return null
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return null
-  }
+  return readJson<RcTokens>(TOKENS_KEY)
 }
 
 function saveTokens(tokens: RcTokens): void {
   safeSet(TOKENS_KEY, JSON.stringify(tokens))
-}
-
-export function clearConnection(): void {
-  safeRemove(TOKENS_KEY)
-  safeRemove(PENDING_KEY)
 }
 
 function redirectUri(): string {
@@ -146,6 +210,7 @@ export async function completePendingConnect(): Promise<{ ok: true } | { ok: fal
       return { ok: false, error: `Token exchange failed (${res.status}): ${body}` }
     }
     const data = await res.json()
+    clearJwtCredentials()
     saveConnectionConfig(pending.config)
     saveTokens({
       accessToken: data.access_token,
@@ -158,16 +223,7 @@ export async function completePendingConnect(): Promise<{ ok: true } | { ok: fal
   }
 }
 
-/** Returns a valid access token, refreshing it first if it's expired or close to it. */
-export async function getValidAccessToken(): Promise<string> {
-  const config = loadConnectionConfig()
-  const tokens = loadTokens()
-  if (!config || !tokens) throw new Error('Not connected to RingCentral.')
-
-  if (tokens.expiresAt - Date.now() > 60_000) {
-    return tokens.accessToken
-  }
-
+async function refreshPkceToken(config: RcConnectionConfig, tokens: RcTokens): Promise<string> {
   const res = await fetch(`${config.serverUrl}/restapi/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -191,6 +247,42 @@ export async function getValidAccessToken(): Promise<string> {
   return next.accessToken
 }
 
+// ---- Mode-agnostic surface ---------------------------------------------------
+
+export function getConnectionMode(): ConnectionMode | null {
+  if (loadJwtCredentials()) return 'jwt'
+  if (loadPkceConfig() && loadTokens()) return 'pkce'
+  return null
+}
+
+export function loadConnectionConfig(): RcConnectionConfig | null {
+  const jwt = loadJwtCredentials()
+  if (jwt) return { clientId: jwt.clientId, serverUrl: jwt.serverUrl }
+  return loadPkceConfig()
+}
+
 export function isConnected(): boolean {
-  return loadConnectionConfig() !== null && loadTokens() !== null
+  return getConnectionMode() !== null
+}
+
+export function clearConnection(): void {
+  clearJwtCredentials()
+  safeRemove(TOKENS_KEY)
+  safeRemove(CONFIG_KEY)
+  safeRemove(PENDING_KEY)
+}
+
+/** Returns a valid access token for whichever connection mode is active, refreshing if needed. */
+export async function getValidAccessToken(): Promise<string> {
+  const jwt = loadJwtCredentials()
+  if (jwt) {
+    if (jwtAccessToken && jwtAccessToken.expiresAt - Date.now() > 60_000) return jwtAccessToken.accessToken
+    return fetchJwtAccessToken(jwt)
+  }
+
+  const config = loadPkceConfig()
+  const tokens = loadTokens()
+  if (!config || !tokens) throw new Error('Not connected to RingCentral.')
+  if (tokens.expiresAt - Date.now() > 60_000) return tokens.accessToken
+  return refreshPkceToken(config, tokens)
 }

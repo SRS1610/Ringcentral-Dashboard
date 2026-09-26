@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { ChartCard } from '../components/ui/ChartCard'
 import { StatusBadge } from '../components/ui/Badge'
 import { useRingCentral } from '../state/RingCentralContext'
@@ -34,17 +34,29 @@ function CopyField({ value }: { value: string }) {
   )
 }
 
+function ErrorBox({ message }: { message: string }) {
+  return (
+    <div className="text-xs rounded-md p-2.5" style={{ background: 'var(--surface-2)', color: 'var(--status-critical)', border: '1px solid var(--border)' }}>
+      {message}
+    </div>
+  )
+}
+
 function ConnectionCard() {
   const rc = useRingCentral()
   const [clientId, setClientId] = useState('')
   const [server, setServer] = useState<'production' | 'sandbox'>('production')
   const [syncDays, setSyncDays] = useState(30)
+  const [remember, setRemember] = useState(false)
+  const [showSignIn, setShowSignIn] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   if (rc.connected) {
+    const modeLabel = rc.mode === 'jwt' ? 'Signed in with a credentials file' : 'Signed in with RingCentral'
     return (
       <ChartCard
         title="RingCentral connection"
-        subtitle={rc.config?.serverUrl}
+        subtitle={`${modeLabel} · ${rc.config?.serverUrl ?? ''}`}
         action={<StatusBadge status="good" label="Connected" />}
       >
         <div className="flex flex-col gap-4">
@@ -83,16 +95,14 @@ function ConnectionCard() {
 
           <div className="text-xs flex flex-col gap-1" style={{ color: 'var(--text-muted)' }}>
             {rc.lastSyncedAt && <span>Last synced {rc.lastSyncedAt.toLocaleString()}</span>}
+            {rc.mode === 'jwt' && !rc.remembered && <span>Credentials are held in memory only and will be cleared when you close this tab.</span>}
+            {rc.mode === 'jwt' && rc.remembered && <span>Credentials are remembered on this browser. Use Disconnect to remove them.</span>}
             {rc.smsSkipped !== null && rc.smsSkipped > 0 && (
               <span>{rc.smsSkipped} extension(s) skipped for SMS — likely a permissions/scope issue on that mailbox.</span>
             )}
           </div>
 
-          {rc.lastError && (
-            <div className="text-xs rounded-md p-2.5" style={{ background: 'var(--surface-2)', color: 'var(--status-critical)', border: '1px solid var(--border)' }}>
-              {rc.lastError}
-            </div>
-          )}
+          {rc.lastError && <ErrorBox message={rc.lastError} />}
         </div>
       </ChartCard>
     )
@@ -100,13 +110,60 @@ function ConnectionCard() {
 
   return (
     <ChartCard title="RingCentral connection" subtitle="Not connected" action={<StatusBadge status="neutral" label="Not connected" />}>
-      <div className="flex flex-col gap-4">
-        {rc.lastError && (
-          <div className="text-xs rounded-md p-2.5" style={{ background: 'var(--surface-2)', color: 'var(--status-critical)', border: '1px solid var(--border)' }}>
-            {rc.lastError}
-          </div>
-        )}
+      <div className="flex flex-col gap-5">
+        {rc.lastError && <ErrorBox message={rc.lastError} />}
 
+        <div className="flex flex-col gap-2">
+          <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+            Option A — Use your credentials file
+          </div>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Pick the JSON credentials file from your RingCentral app (the one with the JWT auth flow). The dashboard signs in with it
+            and imports your data — no other setup needed.
+          </p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) rc.connectWithCredentialsFile(file, remember)
+              e.target.value = ''
+            }}
+          />
+          <div className="flex items-center gap-3 flex-wrap">
+            <button
+              type="button"
+              disabled={rc.connecting}
+              onClick={() => fileInputRef.current?.click()}
+              className="text-sm font-medium rounded-lg px-3.5 py-2"
+              style={{ background: 'var(--series-1)', color: '#ffffff', opacity: rc.connecting ? 0.5 : 1 }}
+            >
+              {rc.connecting ? 'Signing in…' : 'Choose credentials file'}
+            </button>
+            <label className="text-xs flex items-center gap-1.5" style={{ color: 'var(--text-secondary)' }}>
+              <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+              Remember on this browser
+            </label>
+          </div>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Unchecked (recommended on shared computers): the file is used only until you close this tab. Checked: it's saved in this
+            browser's local storage so you don't need to pick it again — treat that like saving a password here.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setShowSignIn((v) => !v)}
+          className="text-xs self-start"
+          style={{ color: 'var(--series-1)' }}
+        >
+          {showSignIn ? 'Hide' : 'Show'} Option B — Sign in with RingCentral (public app, no file)
+        </button>
+
+        {showSignIn && (
+          <div className="flex flex-col gap-4 pt-2" style={{ borderTop: '1px solid var(--border)' }}>
         <div className="flex flex-col gap-1.5">
           <label className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
             Client ID
@@ -155,6 +212,8 @@ function ConnectionCard() {
         >
           {rc.connecting ? 'Redirecting…' : 'Connect to RingCentral'}
         </button>
+          </div>
+        )}
       </div>
     </ChartCard>
   )
@@ -163,19 +222,41 @@ function ConnectionCard() {
 function SetupGuide() {
   return (
     <ChartCard title="One-time app setup" subtitle="Only needed the first time you connect">
-      <ol className="text-sm flex flex-col gap-2 list-decimal pl-5" style={{ color: 'var(--text-secondary)' }}>
-        <li>
-          In the{' '}
-          <a href="https://developers.ringcentral.com/" target="_blank" rel="noreferrer" style={{ color: 'var(--series-1)' }}>
-            RingCentral Developer Console
-          </a>
-          , create an app as a <strong>public / browser-based client</strong> using the <strong>Authorization Code + PKCE</strong> flow — not
-          the server/JWT flow (that one needs a secret and isn't meant for browsers).
-        </li>
-        <li>Add the redirect URI shown above to the app's allowed redirect URIs (add both your local dev URL and the live dashboard URL if you use both).</li>
-        <li>Grant read scopes for call log, messages, and extensions/accounts.</li>
-        <li>Copy the app's Client ID into the field above — public clients don't have a secret to enter.</li>
-      </ol>
+      <div className="text-sm flex flex-col gap-3" style={{ color: 'var(--text-secondary)' }}>
+        <div>
+          <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
+            Option A — credentials file (simplest)
+          </div>
+          <ol className="list-decimal pl-5 flex flex-col gap-1 mt-1">
+            <li>
+              In the{' '}
+              <a href="https://developers.ringcentral.com/" target="_blank" rel="noreferrer" style={{ color: 'var(--series-1)' }}>
+                RingCentral Developer Console
+              </a>
+              , create an app (using an <strong>admin</strong> account) with the <strong>JWT auth flow</strong> enabled, and grant it read scopes
+              for call log, messages, and extensions/accounts.
+            </li>
+            <li>Generate a JWT credential for an admin user and download/save the credentials JSON.</li>
+            <li>Click "Choose credentials file" above and pick that JSON. That's it.</li>
+          </ol>
+          <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+            The same file works for the scheduled GitHub Actions sync (see README) — that's the way to give every viewer one shared,
+            auto-refreshed dataset without anyone signing in.
+          </p>
+        </div>
+        <div>
+          <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
+            Option B — sign in with RingCentral (no file, no secret)
+          </div>
+          <ol className="list-decimal pl-5 flex flex-col gap-1 mt-1">
+            <li>
+              Create a separate app as a <strong>public / browser-based client</strong> using the <strong>Authorization Code + PKCE</strong> flow.
+            </li>
+            <li>Add the redirect URI shown in Option B to the app's allowed redirect URIs.</li>
+            <li>Grant the same read scopes, then paste the app's Client ID into Option B and click Connect.</li>
+          </ol>
+        </div>
+      </div>
     </ChartCard>
   )
 }
@@ -256,9 +337,9 @@ export function Settings() {
         className="text-sm rounded-xl p-4"
         style={{ background: 'var(--surface-1)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
       >
-        <strong style={{ color: 'var(--text-primary)' }}>This connection is local to your browser.</strong> Your RingCentral session
-        credentials are stored only in this browser's local storage and calls go directly from your browser to RingCentral — nothing passes
-        through a server we control. That also means connecting here only refreshes data in <em>your</em> session, not for other people
+        <strong style={{ color: 'var(--text-primary)' }}>This connection is local to your browser.</strong> Your RingCentral credentials
+        stay in this browser (in memory only, unless you choose to remember them) and calls go directly from your browser to RingCentral —
+        nothing passes through a server we control. That also means connecting here only refreshes data in <em>your</em> session, not for other people
         viewing this dashboard. For one shared, always-fresh dataset every viewer sees, use the scheduled GitHub Actions sync described in
         the repo's README instead — this Settings page and that sync can be used together or independently.
       </div>
