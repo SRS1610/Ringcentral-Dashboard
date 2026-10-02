@@ -1,0 +1,44 @@
+name: Apply uploaded patch
+
+# One-off: applies "caller-names-and-staff-metrics (1).patch" to the source,
+# removes the patch, the uploaded zip and this workflow, then redeploys.
+# Runs automatically when this file is added, or manually from the Actions tab.
+# If the patch does not apply cleanly the job fails and nothing is pushed.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/apply-patch.yml
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply the patch, then remove it, the zip and this workflow
+        run: |
+          set -euo pipefail
+          git config user.name "Claude"
+          git config user.email "noreply@anthropic.com"
+          PATCH="caller-names-and-staff-metrics (1).patch"
+          ZIP="ringcentral-dashboard-changed-files (1).zip"
+          git am --3way "$PATCH"
+          git rm -q --ignore-unmatch "$PATCH" "$ZIP" .github/workflows/apply-patch.yml
+          git commit -q -m "Remove the applied patch, the uploaded zip and the one-off apply workflow"
+          git push
+
+      - name: Redeploy with the new code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run deploy-pages.yml --ref "$GITHUB_REF_NAME"
+          gh workflow run deploy-worker.yml --ref "$GITHUB_REF_NAME"
+          gh workflow run deploy-netlify.yml --ref "$GITHUB_REF_NAME" || echo "Netlify deploy not started"
