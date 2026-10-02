@@ -1,0 +1,25 @@
+// Cloudflare Worker that serves the built dashboard (dist/) and the /api/ routes
+// in worker/index.ts. Deploy with `npm run deploy`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Must match the name of the Worker the dashboard runs on.
+  "name": "ringcentral-dashboard",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // Everything under /api/ goes to the Worker code; all other paths are static files.
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": { "enabled": true }
+
+  // Secrets are set with `npx wrangler secret put <NAME>` (or in the Cloudflare dashboard), never here:
+  //   RC_CREDENTIALS_JSON   the whole credentials file of the RingCentral JWT app
+  //                         (or RC_CLIENT_ID + RC_CLIENT_SECRET + RC_JWT separately)
+  //   DASHBOARD_PASSWORD    the password viewers enter once to see live data
+  // Optional plain variables ("vars"):
+  //   RC_SERVER_URL         https://platform.devtest.ringcentral.com for a sandbox account
+  //   DASHBOARD_AUTH        "none" if Cloudflare Access (or similar) already protects the site
+}

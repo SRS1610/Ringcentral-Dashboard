@@ -19,6 +19,7 @@ interface DataContextValue {
   loadSmsFile: (file: File) => Promise<void>
   setCallsFromRingCentral: (records: CallRecord[], label: string) => void
   setSmsFromRingCentral: (records: SmsRecord[], label: string) => void
+  setQosFromRingCentral: (records: QosRecord[], label: string) => void
   /** Drops uploads and browser imports, going back to the data files published with the site. */
   resetToSiteData: () => Promise<void>
   range: DateRange | null
@@ -72,7 +73,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // The site's data files (public/data/, kept current by the scheduled RingCentral sync)
-  // can arrive after a browser RingCentral import or an upload has already landed;
+  // can arrive after a live RingCentral import or an upload has already landed;
   // `replaceExisting: false` keeps that data instead of clobbering it. The explicit
   // "Clear uploads and imports" action passes true.
   const loadSiteData = useCallback(async ({ replaceExisting }: { replaceExisting: boolean }) => {
@@ -149,6 +150,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setSms({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
   }, [])
 
+  const setQosFromRingCentral = useCallback((records: QosRecord[], label: string) => {
+    setQos({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
+  }, [])
+
   const dataBounds = useMemo(() => {
     const dates = [...calls.records.map((c) => c.startTime), ...qos.records.map((q) => q.date), ...sms.records.map((s) => s.dateTime)]
     return computeBounds(dates)
@@ -168,6 +173,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     loadSmsFile,
     setCallsFromRingCentral,
     setSmsFromRingCentral,
+    setQosFromRingCentral,
     resetToSiteData,
     range,
     preset,

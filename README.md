@@ -93,73 +93,44 @@ This sync only touches the repo's own data files. If someone uploads a
 CSV through the dashboard's "Upload data" button, that file lives only in
 their browser and is never affected by this sync.
 
-## Sign in with RingCentral (Settings tab)
+## Live data: the Cloudflare Worker (recommended)
 
-The header shows **Sign in to RingCentral** on every tab. It opens the
-Settings tab, whose **Sign in with RingCentral** button sends you to
-RingCentral's own login page to enter your RingCentral username and password
-(the dashboard never sees the password), then brings you back signed in. It
-uses OAuth **Authorization Code + PKCE**, the flow RingCentral provides for
-browser apps, so no client secret is involved.
+The dashboard runs on a Cloudflare Worker (`worker/`, config in `wrangler.jsonc`). The Worker serves the built site and a small JSON API under `/api/` that **signs in to RingCentral server-side** with a JWT app credential kept in Worker secrets. Viewers never handle RingCentral credentials: they enter one shared **dashboard password** in the Settings tab, and the last 30 days of calls, SMS and **service quality** import automatically. Picking dates on the calendar fetches exactly that window.
 
-- **After signing in**, your last 30 days of call log and SMS import
-  automatically. The header shows `Live · <your name>`. Settings shows who is
-  signed in, lets you re-import 7/30/90 days, and has **Sign out** (which also
-  revokes the session with RingCentral).
-- **Staying signed in**: the session is kept in this browser and data
-  re-imports each time the dashboard opens, until you sign out.
-- **Admins vs. everyone else**: RingCentral admins get company-wide data.
-  Anyone else is shown their own calls and messages, with a note explaining
-  why, rather than an error.
-- **Rate limits**: if RingCentral answers "too many requests", the import
-  waits and retries.
+What the Worker fetches:
 
-**One-time setup (a RingCentral admin, once):** in the RingCentral Developer
-Console create a **new** REST API app. Under Auth choose "3-legged OAuth flow
-authorization code", then "Client-side web app" (PKCE, no client secret).
-Settings also links to the console's new-app form with these values filled
-in. Set the OAuth Redirect URI to the one shown in Settings (for the live site
-it's `https://srs1610.github.io/Ringcentral-Dashboard/`), grant Read Accounts,
-Read Call Log and Read Messages, and copy the app's **Client ID**. Put that
-Client ID in `public/ringcentral-app.json` so everyone just sees the sign-in
-button. Or enter it once in Settings, and that browser remembers it. The
-Client ID is not a secret, since it's sent to every browser that signs in.
+| Tab | RingCentral API | Notes |
+|---|---|---|
+| Call Activity, Team Performance, Overview | Call Log API (`/account/~/call-log`) | Company-wide when the JWT's user is an admin; otherwise that user's own calls |
+| Messaging | Message Store API, per user extension | Only numbers, time, direction and status reach the browser — never message text |
+| Service Quality | **Business Analytics API** (`/analytics/calls/v1/.../timeline/fetch`), grouped by call queue, one point per day | Service level = calls in SLA ÷ (in SLA + out of SLA), per the SLA target set on each queue in RingCentral. Speed of answer and handle time are averaged over answered calls (ring time; talk + hold). Analytics keeps about 184 days. |
 
-This has to be a different app from the JWT app used by the scheduled sync
-and the credentials file. A JWT app has no redirect URI, so RingCentral
-rejects browser sign-in with it: "No redirect URI is registered for this
-client application" (OAU-113). RingCentral shows that error on its own page
-and doesn't send you back. When you return to the dashboard, Settings
-explains the fix and lets you enter the new Client ID.
+One-time setup (whoever manages the Worker):
 
-**Alternative: credentials file.** Under "Or use a credentials file instead",
-you can pick the same credentials JSON used by the scheduled sync (from a
-JWT-flow app) to sign in without RingCentral's login page. By default the
-file is held in memory only and forgotten when the tab closes. The
-"remember on this browser" checkbox saves it in local storage instead; treat
-that like saving a password, and avoid it on shared machines.
+1. In the [RingCentral Developer Console](https://developers.ringcentral.com/), use an app with the **JWT auth flow** (the same one the scheduled sync uses) and the permissions **Read Accounts**, **Read Call Log**, **Read Messages** and **Analytics**. Create a JWT credential for an **admin** user and download the credentials JSON. The Business Analytics API needs a RingEX plan that includes it; if your plan doesn't, every other tab still works and Service Quality stays upload-only.
+2. Give the Worker its secrets (from a checkout with `npm install` done, logged in with `npx wrangler login`):
 
-Both methods call RingCentral straight from the browser. Note that every
-GitHub Pages project site under `srs1610.github.io` shares one browser origin
-and so shares local storage. Only host sites you trust there. If RingCentral
-ever refuses cross-origin requests for your app type, the scheduled GitHub
-Actions sync does the same import server-side and is unaffected.
+   ```sh
+   npx wrangler secret put RC_CREDENTIALS_JSON   # paste the whole credentials file
+   npx wrangler secret put DASHBOARD_PASSWORD    # the password viewers will type
+   ```
 
-**Important scope limitation:** because this dashboard has no backend, the
-connection lives only in the browser that made it — local storage, not shared
-state. Connecting and syncing from your laptop refreshes what *you* see; it
-does not push data to other people viewing the same dashboard URL. For a
-single shared dataset every executive sees without connecting themselves, use
-the scheduled GitHub Actions sync instead. The two are independent and can be
-used together (e.g. the scheduled sync keeps the default view fresh for
-everyone, while anyone who wants to double-check right now can hit "Sync now"
-in Settings for their own session).
+   Or add them under the Worker's *Settings → Variables and Secrets* in the Cloudflare dashboard. `RC_CLIENT_ID` / `RC_CLIENT_SECRET` / `RC_JWT` as three separate secrets also work. For a sandbox account add a plain variable `RC_SERVER_URL` = `https://platform.devtest.ringcentral.com`. If the site is already behind Cloudflare Access or similar, set the variable `DASHBOARD_AUTH` to `none` instead of a password.
+3. Deploy: `npm run deploy` (builds, then `wrangler deploy`). Or let GitHub do it on every push: add the repository secrets `CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit) and `CLOUDFLARE_ACCOUNT_ID`, and `.github/workflows/deploy-worker.yml` runs the tests and deploys. Make sure the `name` in `wrangler.jsonc` matches your Worker.
+
+Running it locally: `npm run dev:worker` builds the site and starts `wrangler dev` with the API. Put local secrets in a `.dev.vars` file (git-ignored), e.g. `DASHBOARD_PASSWORD=test`. Plain `npm run dev` (Vite only) has no API, and Settings says so.
+
+How the browser talks to it: every `/api/` request carries the dashboard password. The Worker exchanges the JWT for a RingCentral access token, keeps it in memory, and also hands the browser an encrypted copy (`X-RC-Session` header) that only the Worker's secrets can open, so a recycled Worker doesn't need a new token for every viewer — RingCentral allows only a few token requests per minute. The browser can't read that blob. The access token, the client secret and the JWT never leave the Worker; the API is read-only (GET) and returns only the fields the dashboard shows. `npm test` covers these routes against a fake RingCentral.
+
+Imported data lives in the viewer's browser tab. Uploads (the **Upload data** button) still work and override the live import for that dataset; **Clear uploads and imports** goes back to the site's data files. A static copy of the site (GitHub Pages or Netlify, below) has no `/api/`, so there the Settings tab shows "No dashboard server on this site" and only uploads and the scheduled sync's data files are available.
+
 
 ## Project structure
 
-- `src/lib/` — CSV parsing (`parsers.ts`, `csv.ts`), metrics/aggregation (`metrics.ts`), formatting (`format.ts`)
+- `src/lib/` — CSV parsing (`parsers.ts`, `csv.ts`), metrics/aggregation (`metrics.ts`), formatting (`format.ts`), the client for the Worker's API (`dashboardApi.ts`, `ringcentralApi.ts`)
 - `src/state/` — data loading & date-range filtering (`DataContext.tsx`, `useFilteredData.ts`)
 - `src/components/` — shared UI (stat tiles, chart cards) and chart primitives (`charts/`)
+- `worker/` — the Cloudflare Worker: `index.ts` (routes, dashboard password), `ringcentral.ts` (JWT sign-in, token handling), `mappers.ts` (API → dashboard records); tests in `test/`
 - `scripts/` — optional RingCentral sync job (`sync-ringcentral.mjs`), run by `.github/workflows/sync-ringcentral.yml`
 - `src/sections/` — the five dashboard tabs (Overview, Call Activity, Service Quality, Messaging, Team Performance)
 

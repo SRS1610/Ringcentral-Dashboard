@@ -20,27 +20,27 @@ const NEEDS: Record<DashboardSection, { datasets: DatasetKey[]; title: string; b
   overview: {
     datasets: ['calls', 'qos', 'sms'],
     title: 'No data yet',
-    body: 'Sign in to RingCentral to import your call log and SMS, or upload RingCentral export files.',
+    body: 'Unlock live data in Settings to import calls, SMS and service quality from RingCentral, or upload RingCentral export files.',
   },
   calls: {
     datasets: ['calls'],
     title: 'No call data yet',
-    body: 'Sign in to RingCentral to import your call log, or upload a RingCentral Call Log Report export.',
+    body: 'Unlock live data in Settings to import the call log from RingCentral, or upload a RingCentral Call Log Report export.',
   },
   quality: {
     datasets: ['qos'],
     title: 'No service quality data yet',
-    body: 'Service level, abandon rate and speed of answer come from the RingCentral Analytics Portal export. Upload it to fill this tab.',
+    body: 'Service level, abandon rate and speed of answer come from RingCentral Analytics for your call queues. Unlock live data in Settings, or upload an Analytics Portal export.',
   },
   messaging: {
     datasets: ['sms'],
     title: 'No SMS data yet',
-    body: 'Sign in to RingCentral to import your SMS, or upload a RingCentral message log export.',
+    body: 'Unlock live data in Settings to import SMS from RingCentral, or upload a RingCentral message log export.',
   },
   team: {
     datasets: ['calls'],
     title: 'No call data yet',
-    body: 'Team rankings are built from the call log. Sign in to RingCentral to import it, or upload a Call Log Report export.',
+    body: 'Team rankings are built from the call log. Unlock live data in Settings to import it, or upload a Call Log Report export.',
   },
 }
 
@@ -55,7 +55,6 @@ function Content({ section, onOpenSettings, onOpenUpload }: { section: SectionKe
       <EmptyState
         title={need.title}
         body={need.body}
-        canSignIn={need.datasets.some((k) => k !== 'qos')}
         onOpenSettings={onOpenSettings}
         onOpenUpload={onOpenUpload}
       />
@@ -92,7 +91,7 @@ function App() {
             <Content section={section} onOpenSettings={openSettings} onOpenUpload={openUpload} />
           </main>
           <footer className="border-t py-4 px-4 sm:px-6 text-xs text-center" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
-            Data comes from RingCentral: the scheduled sync, signing in via Settings, or export files you upload.
+            Data comes from RingCentral: live through the dashboard server, the scheduled sync, or export files you upload.
           </footer>
           {uploadOpen && <UploadPanel onClose={() => setUploadOpen(false)} />}
         </div>

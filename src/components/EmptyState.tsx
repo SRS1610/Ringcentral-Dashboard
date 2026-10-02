@@ -7,19 +7,26 @@ import { useRingCentral } from '../state/RingCentralContext'
 export function EmptyState({
   title,
   body,
-  canSignIn,
   onOpenSettings,
   onOpenUpload,
 }: {
   title: string
   body: string
-  /** False when the data can only come from an upload (e.g. Analytics / QoS). */
-  canSignIn: boolean
   onOpenSettings: () => void
   onOpenUpload: () => void
 }) {
   const rc = useRingCentral()
-  const showSignIn = canSignIn && rc.ready && !rc.connected
+  // Offer the live connection whenever there is a dashboard server to connect to.
+  const showConnect = rc.ready && !rc.connected && rc.backend !== 'unavailable'
+  const connectLabel = rc.backend === 'locked' ? 'Unlock live data' : 'Open Settings'
+  const hint =
+    rc.backend === 'unavailable'
+      ? 'Once the scheduled RingCentral sync is set up, call and SMS data appears here for everyone automatically.'
+      : rc.connected
+        ? rc.syncing
+          ? 'Importing from RingCentral…'
+          : 'RingCentral returned nothing for this tab. Settings shows the details of the last import.'
+        : 'With the dashboard password, the last 30 days import from RingCentral automatically.'
   return (
     <div
       className="rounded-xl border px-6 py-12 sm:py-16 flex flex-col items-center text-center gap-3"
@@ -35,14 +42,14 @@ export function EmptyState({
         {body}
       </p>
       <div className="flex items-center gap-2 flex-wrap justify-center mt-2">
-        {showSignIn && (
+        {showConnect && (
           <button
             type="button"
             onClick={onOpenSettings}
             className="text-sm font-medium rounded-lg px-3.5 py-2"
             style={{ background: 'var(--series-1)', color: '#ffffff' }}
           >
-            Sign in to RingCentral
+            {connectLabel}
           </button>
         )}
         <button
@@ -50,7 +57,7 @@ export function EmptyState({
           onClick={onOpenUpload}
           className="text-sm font-medium rounded-lg px-3.5 py-2"
           style={
-            showSignIn
+            showConnect
               ? { border: '1px solid var(--border)', color: 'var(--text-secondary)' }
               : { background: 'var(--series-1)', color: '#ffffff' }
           }
@@ -58,11 +65,9 @@ export function EmptyState({
           Upload RingCentral exports
         </button>
       </div>
-      {canSignIn && (
-        <p className="text-xs max-w-md mt-1" style={{ color: 'var(--text-muted)' }}>
-          Once the scheduled RingCentral sync is set up, data appears here for everyone automatically.
-        </p>
-      )}
+      <p className="text-xs max-w-md mt-1" style={{ color: 'var(--text-muted)' }}>
+        {hint}
+      </p>
     </div>
   )
 }

@@ -49,7 +49,7 @@ export function DateRangeControl() {
     const picked = { start: startOfDay(draft.start), end: endOfDay(draft.end) }
     setCustomRange(picked)
     setOpen(false)
-    // Signed in: pull exactly this window's call records (and SMS) from RingCentral.
+    // Connected: pull exactly this window's calls, SMS and service quality from RingCentral.
     if (rc.connected && !rc.syncing) void rc.syncNow(picked)
   }
 
@@ -125,13 +125,13 @@ export function DateRangeControl() {
                   className="text-sm font-medium rounded-lg px-3.5 py-1.5"
                   style={{ background: 'var(--series-1)', color: '#ffffff', opacity: draft ? 1 : 0.5 }}
                 >
-                  {rc.connected ? 'Get call records' : 'Apply'}
+                  {rc.connected ? 'Get RingCentral data' : 'Apply'}
                 </button>
               </div>
             </div>
             {!rc.connected && (
               <p className="text-xs mt-2 max-w-[520px]" style={{ color: 'var(--text-muted)' }}>
-                Filters the data already loaded. Sign in to RingCentral to fetch call records for any dates you pick.
+                Filters the data already loaded. Unlock live data in Settings to fetch RingCentral records for any dates you pick.
               </p>
             )}
           </div>

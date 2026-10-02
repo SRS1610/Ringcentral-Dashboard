@@ -1,58 +1,48 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import {
-  beginConnect,
-  clearConnection,
-  completePendingConnect,
-  forgetRememberedApp,
-  getConnectionMode,
-  getValidAccessToken,
-  jwtCredentialsRemembered,
-  loadConnectionConfig,
-  loadRememberedApp,
-  loadSiteAppConfig,
-  redirectUriForDisplay,
-  rememberApp,
-  setJwtCredentials,
-  signInAppRegistrationUrl,
-  signOutAndRevoke,
-  takeAbandonedSignIn,
-  RC_SERVER_URLS,
-  type ConnectionMode,
-  type RcAppConfig,
-  type RcConnectionConfig,
-} from '../lib/ringcentralAuth'
-import { parseCredentialsJson } from '../lib/ringcentralCredentials'
-import { fetchCurrentUser, syncCallLog, syncSms, type DataScope, type RcUser, type SyncWindow } from '../lib/ringcentralApi'
+import { ApiError, clearPassword, loadPassword, passwordRemembered, setPassword } from '../lib/dashboardApi'
+import { fetchStatus, syncCallLog, syncQos, syncSms, type DataScope, type RcUser, type SyncWindow } from '../lib/ringcentralApi'
 import { loadDepartmentMap, saveDepartmentMap, type DepartmentMap } from '../lib/departmentMap'
 import { useData } from './DataContext'
 
 const AUTO_SYNC_DAYS = 30
 
+/**
+ * Where the dashboard's server-side RingCentral connection stands:
+ * - connected: the Worker is signed in to RingCentral and this browser may read from it
+ * - locked: the Worker wants the dashboard password
+ * - not_configured: the Worker is missing its secrets
+ * - unavailable: this copy of the site has no Worker behind it (static hosting or `vite dev`)
+ * - error: the Worker couldn't sign in to RingCentral
+ */
+export type BackendState = 'checking' | 'connected' | 'locked' | 'not_configured' | 'unavailable' | 'error'
+
 interface RingCentralContextValue {
   ready: boolean
   connected: boolean
-  mode: ConnectionMode | null
-  remembered: boolean
-  config: RcConnectionConfig | null
+  backend: BackendState
+  /** Explains a locked / not_configured / unavailable / error state. */
+  backendMessage: string | null
   user: RcUser | null
+  environment: 'production' | 'sandbox' | null
   scope: DataScope | null
-  appConfig: RcAppConfig | null
+  /** True when the dashboard password is saved on this browser. */
+  remembered: boolean
+  /** True when this browser holds a dashboard password (so "Lock" makes sense). */
+  hasPassword: boolean
   connecting: boolean
   syncing: boolean
   syncStatus: string | null
   lastSyncedAt: Date | null
   lastError: string | null
-  /** Set when RingCentral rejected a sign-in without redirecting back (e.g. OAU-113). */
-  abandonedApp: RcConnectionConfig | null
   smsSkipped: number | null
-  redirectUri: string
-  appRegistrationUrl: string
+  /** Anything worth knowing about the last service-quality import. */
+  qosNote: string | null
   departmentMap: DepartmentMap
-  signIn: (appOverride?: RcConnectionConfig) => Promise<void>
-  changeApp: () => void
-  connectWithCredentialsFile: (file: File, remember: boolean) => Promise<void>
-  signOut: () => Promise<void>
-  /** Import calls + SMS for the last N days, or for an exact calendar from/to window. */
+  unlock: (password: string, remember: boolean) => Promise<void>
+  /** Forgets the dashboard password on this browser. */
+  lock: () => void
+  retry: () => Promise<void>
+  /** Import calls, SMS and service quality for the last N days, or for an exact calendar from/to window. */
   syncNow: (window: SyncWindow) => Promise<void>
   updateDepartmentMap: (map: DepartmentMap) => void
 }
@@ -60,25 +50,24 @@ interface RingCentralContextValue {
 const RingCentralContext = createContext<RingCentralContextValue | null>(null)
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+const isLocked = (e: unknown) => e instanceof ApiError && e.status === 401
 
 export function RingCentralProvider({ children }: { children: ReactNode }) {
-  const { setCallsFromRingCentral, setSmsFromRingCentral } = useData()
-  const [ready, setReady] = useState(false)
-  const [connected, setConnected] = useState(false)
-  const [mode, setMode] = useState<ConnectionMode | null>(null)
-  const [remembered, setRemembered] = useState(false)
-  const [config, setConfig] = useState<RcConnectionConfig | null>(null)
+  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral } = useData()
+  const [backend, setBackend] = useState<BackendState>('checking')
+  const [backendMessage, setBackendMessage] = useState<string | null>(null)
   const [user, setUser] = useState<RcUser | null>(null)
+  const [environment, setEnvironment] = useState<'production' | 'sandbox' | null>(null)
   const [scope, setScope] = useState<DataScope | null>(null)
-  const [siteApp, setSiteApp] = useState<RcAppConfig | null>(null)
-  const [appConfig, setAppConfig] = useState<RcAppConfig | null>(() => loadRememberedApp())
+  const [remembered, setRemembered] = useState(() => passwordRemembered())
+  const [hasPassword, setHasPassword] = useState(() => loadPassword() !== null)
   const [connecting, setConnecting] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [syncStatus, setSyncStatus] = useState<string | null>(null)
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null)
   const [lastError, setLastError] = useState<string | null>(null)
-  const [abandonedApp, setAbandonedApp] = useState<RcConnectionConfig | null>(null)
   const [smsSkipped, setSmsSkipped] = useState<number | null>(null)
+  const [qosNote, setQosNote] = useState<string | null>(null)
   const [departmentMap, setDepartmentMap] = useState<DepartmentMap>(() => loadDepartmentMap())
   // A ref so syncs started from long-lived callbacks always use the latest mapping.
   const deptRef = useRef(departmentMap)
@@ -86,13 +75,28 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
     deptRef.current = departmentMap
   }, [departmentMap])
 
-  const refreshConnectionState = useCallback(() => {
-    const nextMode = getConnectionMode()
-    setMode(nextMode)
-    setConnected(nextMode !== null)
-    setConfig(loadConnectionConfig())
-    setRemembered(nextMode === 'jwt' ? jwtCredentialsRemembered() : nextMode === 'pkce')
-    return nextMode !== null
+  const applyFailure = useCallback((e: unknown) => {
+    setUser(null)
+    setScope(null)
+    if (e instanceof ApiError && e.status === 401) {
+      // A saved password that no longer works is dropped so the prompt starts clean.
+      if (e.code === 'password_wrong') {
+        clearPassword()
+        setHasPassword(false)
+        setRemembered(false)
+      }
+      setBackend('locked')
+      setBackendMessage(e.code === 'password_wrong' ? e.message : null)
+    } else if (e instanceof ApiError && e.code === 'no_backend') {
+      setBackend('unavailable')
+      setBackendMessage(e.message)
+    } else if (e instanceof ApiError && e.code === 'not_configured') {
+      setBackend('not_configured')
+      setBackendMessage(e.message)
+    } else {
+      setBackend('error')
+      setBackendMessage(message(e))
+    }
   }, [])
 
   const syncNow = useCallback(
@@ -101,139 +105,108 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       const label = typeof window === 'number' ? `RingCentral (last ${window}d)` : `RingCentral (${fmt(window.start)} – ${fmt(window.end)})`
       setSyncing(true)
       setLastError(null)
+      setQosNote(null)
       const errors: string[] = []
       let anySucceeded = false
+      let locked: unknown = null
       const scopes: DataScope[] = []
 
-      // Sequential on purpose: RingCentral rate-limits the call-log API, so don't double the load.
+      // Sequential on purpose: RingCentral rate-limits these APIs, so don't double the load.
       try {
         const calls = await syncCallLog(deptRef.current, window, setSyncStatus)
         setCallsFromRingCentral(calls.records, label)
         scopes.push(calls.scope)
         anySucceeded = true
       } catch (e) {
+        if (isLocked(e)) locked = e
         errors.push(`Call log: ${message(e)}`)
       }
-      try {
-        const sms = await syncSms(deptRef.current, window, setSyncStatus)
-        setSmsFromRingCentral(sms.records, label)
-        setSmsSkipped(sms.skippedExtensions)
-        scopes.push(sms.scope)
-        anySucceeded = true
-      } catch (e) {
-        errors.push(`SMS: ${message(e)}`)
+      if (!locked) {
+        try {
+          const sms = await syncSms(deptRef.current, window, setSyncStatus)
+          setSmsFromRingCentral(sms.records, label)
+          setSmsSkipped(sms.skippedExtensions)
+          scopes.push(sms.scope)
+          anySucceeded = true
+        } catch (e) {
+          if (isLocked(e)) locked = e
+          errors.push(`SMS: ${message(e)}`)
+        }
+      }
+      if (!locked) {
+        try {
+          const qos = await syncQos(window, setSyncStatus)
+          const notes: string[] = []
+          // An empty answer leaves any uploaded Analytics export in place rather than blanking the tab.
+          if (qos.records.length > 0) setQosFromRingCentral(qos.records, label)
+          else notes.push('RingCentral Analytics returned no call-queue data for this period.')
+          if (qos.skippedNoSla > 0) notes.push(`${qos.skippedNoSla} queue-day(s) had calls but no SLA classification and are left out of Service Quality.`)
+          if (qos.clampedToDays) notes.push(`RingCentral Analytics only keeps about ${qos.clampedToDays} days, so earlier dates have no service quality data.`)
+          setQosNote(notes.length > 0 ? notes.join(' ') : null)
+          anySucceeded = true
+        } catch (e) {
+          if (isLocked(e)) locked = e
+          errors.push(`Service quality: ${message(e)}`)
+        }
       }
 
+      if (locked) applyFailure(locked)
       if (scopes.length > 0) setScope(scopes.includes('self') ? 'self' : 'company')
       if (errors.length > 0) setLastError(errors.join(' | '))
       if (anySucceeded) setLastSyncedAt(new Date())
       setSyncStatus(null)
       setSyncing(false)
     },
-    [setCallsFromRingCentral, setSmsFromRingCentral],
+    [setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, applyFailure],
   )
 
-  const afterSignIn = useCallback(async () => {
+  /** Asks the Worker who it is signed in as; on success, imports the default window. */
+  const connect = useCallback(async () => {
+    setConnecting(true)
     try {
-      setUser(await fetchCurrentUser())
-    } catch {
-      // Profile is cosmetic; the import below reports any real access problem.
+      const status = await fetchStatus()
+      setUser(status.user)
+      setEnvironment(status.environment)
+      setBackend('connected')
+      setBackendMessage(null)
+      setConnecting(false)
+      await syncNow(AUTO_SYNC_DAYS)
+    } catch (e) {
+      applyFailure(e)
+      setConnecting(false)
     }
-    await syncNow(AUTO_SYNC_DAYS)
-  }, [syncNow])
+  }, [syncNow, applyFailure])
 
   const started = useRef(false)
   useEffect(() => {
     if (started.current) return
     started.current = true
-    ;(async () => {
-      const site = await loadSiteAppConfig()
-      setSiteApp(site)
-      setAppConfig(site ?? loadRememberedApp())
+    void connect()
+  }, [connect])
 
-      const result = await completePendingConnect()
-      if (result && !result.ok) setLastError(`Sign-in didn't complete: ${result.error}`)
-      if (!result) setAbandonedApp(takeAbandonedSignIn())
-      const isIn = refreshConnectionState()
-      setReady(true)
-      if (isIn) await afterSignIn()
-    })()
-  }, [refreshConnectionState, afterSignIn])
-
-  // Coming "Back" from RingCentral's error page can restore this page from the
-  // back/forward cache, where the mount effect above doesn't run again.
-  useEffect(() => {
-    const onPageShow = (e: PageTransitionEvent) => {
-      if (!e.persisted) return
-      setConnecting(false)
-      const abandoned = takeAbandonedSignIn()
-      if (abandoned) setAbandonedApp(abandoned)
-    }
-    window.addEventListener('pageshow', onPageShow)
-    return () => window.removeEventListener('pageshow', onPageShow)
-  }, [])
-
-  const signIn = useCallback(
-    async (appOverride?: RcConnectionConfig) => {
-      const app = appOverride ?? appConfig
-      if (!app) {
-        setLastError('Enter your RingCentral app Client ID first (one-time setup).')
-        return
-      }
-      if (appOverride) {
-        rememberApp(appOverride)
-        setAppConfig({ ...appOverride, source: 'browser' })
-      }
-      setConnecting(true)
-      setLastError(null)
-      setAbandonedApp(null)
-      try {
-        await beginConnect(app)
-        // Navigates to RingCentral's login page; nothing after this runs in-page.
-      } catch (e) {
-        setConnecting(false)
-        setLastError(`Couldn't start sign-in: ${message(e)}`)
-      }
+  const unlock = useCallback(
+    async (password: string, remember: boolean) => {
+      setPassword(password, remember)
+      setHasPassword(true)
+      setRemembered(remember)
+      await connect()
     },
-    [appConfig],
+    [connect],
   )
 
-  const changeApp = useCallback(() => {
-    forgetRememberedApp()
-    setAppConfig(siteApp)
-  }, [siteApp])
-
-  const connectWithCredentialsFile = useCallback(
-    async (file: File, remember: boolean) => {
-      setConnecting(true)
-      setLastError(null)
-      setAbandonedApp(null)
-      try {
-        const creds = parseCredentialsJson(await file.text(), RC_SERVER_URLS.production)
-        setJwtCredentials(creds, remember)
-        await getValidAccessToken() // prove the credentials before reporting "signed in"
-        refreshConnectionState()
-        setConnecting(false)
-        await afterSignIn()
-      } catch (e) {
-        clearConnection()
-        refreshConnectionState()
-        setLastError(message(e))
-        setConnecting(false)
-      }
-    },
-    [refreshConnectionState, afterSignIn],
-  )
-
-  const signOut = useCallback(async () => {
-    await signOutAndRevoke()
-    refreshConnectionState()
+  const lock = useCallback(() => {
+    clearPassword()
+    setHasPassword(false)
+    setRemembered(false)
     setUser(null)
     setScope(null)
     setLastSyncedAt(null)
     setLastError(null)
     setSmsSkipped(null)
-  }, [refreshConnectionState])
+    setQosNote(null)
+    setBackend('locked')
+    setBackendMessage(null)
+  }, [])
 
   const updateDepartmentMap = useCallback((map: DepartmentMap) => {
     setDepartmentMap(map)
@@ -242,52 +215,48 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<RingCentralContextValue>(
     () => ({
-      ready,
-      connected,
-      mode,
-      remembered,
-      config,
+      ready: backend !== 'checking',
+      connected: backend === 'connected',
+      backend,
+      backendMessage,
       user,
+      environment,
       scope,
-      appConfig,
+      remembered,
+      hasPassword,
       connecting,
       syncing,
       syncStatus,
       lastSyncedAt,
       lastError,
-      abandonedApp,
       smsSkipped,
-      redirectUri: redirectUriForDisplay(),
-      appRegistrationUrl: signInAppRegistrationUrl(),
+      qosNote,
       departmentMap,
-      signIn,
-      changeApp,
-      connectWithCredentialsFile,
-      signOut,
+      unlock,
+      lock,
+      retry: connect,
       syncNow,
       updateDepartmentMap,
     }),
     [
-      ready,
-      connected,
-      mode,
-      remembered,
-      config,
+      backend,
+      backendMessage,
       user,
+      environment,
       scope,
-      appConfig,
+      remembered,
+      hasPassword,
       connecting,
       syncing,
       syncStatus,
       lastSyncedAt,
       lastError,
-      abandonedApp,
       smsSkipped,
+      qosNote,
       departmentMap,
-      signIn,
-      changeApp,
-      connectWithCredentialsFile,
-      signOut,
+      unlock,
+      lock,
+      connect,
       syncNow,
       updateDepartmentMap,
     ],
