@@ -48,8 +48,30 @@ async function fetchExtensions(config, token) {
   return records.filter((r) => r.type === 'User')
 }
 
-function mapCallRecord(record, deptMap) {
-  const extensionNumber = record.extension?.extensionNumber ?? ''
+const ANSWERED_RESULTS = new Set(['Accepted', 'Call connected'])
+
+/**
+ * Who on the account the call belongs to. The record's own `extension` carries only an id,
+ * so the name and number come from the extension list. The fallbacks read only the account's
+ * side of the call (`from` on outbound, `to` on inbound) — the other side is the outside
+ * party, whose caller-ID label must not be recorded as a team member. Mirrors worker/mappers.ts.
+ */
+function callOwner(record, directory) {
+  const ourSide = record.direction === 'Outbound' ? record.from : record.to
+  const lookup = (id) => (id === undefined || id === null ? undefined : directory.get(String(id)))
+  let owner = lookup(record.extension?.id) ?? lookup(ourSide?.extensionId)
+  if (owner?.type !== 'User') {
+    const answeredBy = (record.legs ?? []).map((leg) => (ANSWERED_RESULTS.has(leg.result) ? lookup(leg.extension?.id) : undefined)).find((e) => e?.type === 'User')
+    owner = answeredBy ?? owner
+  }
+  return {
+    name: owner?.name ?? record.extension?.name ?? ourSide?.name ?? 'Unassigned',
+    extensionNumber: owner?.extensionNumber ?? record.extension?.extensionNumber ?? ourSide?.extensionNumber ?? '',
+  }
+}
+
+function mapCallRecord(record, deptMap, directory) {
+  const owner = callOwner(record, directory)
   return {
     'Call ID': record.id,
     'Start Time': record.startTime,
@@ -58,12 +80,23 @@ function mapCallRecord(record, deptMap) {
     'From Number': record.from?.phoneNumber ?? record.from?.extensionNumber ?? '',
     'To Name': record.to?.name ?? '',
     'To Number': record.to?.phoneNumber ?? record.to?.extensionNumber ?? '',
-    'Extension Number': extensionNumber,
-    'Extension Name': record.extension?.name ?? record.to?.name ?? record.from?.name ?? 'Unassigned',
-    Department: departmentFor(deptMap, extensionNumber),
+    'Extension Number': owner.extensionNumber,
+    'Extension Name': owner.name || 'Unassigned',
+    Department: departmentFor(deptMap, owner.extensionNumber),
     'Duration (Seconds)': record.duration ?? 0,
     Result: record.result ?? 'Unknown',
     Recorded: record.recording ? 'Yes' : 'No',
+  }
+}
+
+/** Every extension on the account by id, any status, so past calls of disabled users still resolve. */
+async function fetchDirectory(config, token) {
+  try {
+    const records = await fetchAllPages(config, token, '/restapi/v1.0/account/~/extension', {})
+    return new Map(records.map((r) => [String(r.id), { name: r.name, extensionNumber: r.extensionNumber, type: r.type }]))
+  } catch (err) {
+    console.warn(`  Couldn't list extensions (${err.message.split('\n')[0]}); calls keep the names RingCentral put on each record.`)
+    return new Map()
   }
 }
 
@@ -94,7 +127,8 @@ async function syncCallLog(config, token, deptMap) {
     dateTo,
   })
   console.log(`  ${records.length} call log records fetched.`)
-  const newRows = records.map((r) => mapCallRecord(r, deptMap))
+  const directory = await fetchDirectory(config, token)
+  const newRows = records.map((r) => mapCallRecord(r, deptMap, directory))
   const existingRows = readCsvRows(CALL_LOG_PATH)
   const merged = mergeRows({
     existingRows,

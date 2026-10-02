@@ -7,17 +7,24 @@ interface StatTileProps {
   delta?: number | null
   deltaGoodDirection?: 'up' | 'down'
   icon?: ReactNode
+  /** Makes the tile a button, e.g. to list the calls behind the number. */
+  onClick?: () => void
+  active?: boolean
+  actionLabel?: string
 }
 
-export function StatTile({ label, value, sublabel, delta, deltaGoodDirection = 'up', icon }: StatTileProps) {
+export function StatTile({ label, value, sublabel, delta, deltaGoodDirection = 'up', icon, onClick, active, actionLabel }: StatTileProps) {
   const hasDelta = delta !== undefined && delta !== null && Number.isFinite(delta)
   const isUp = hasDelta && delta! > 0.05
   const isDown = hasDelta && delta! < -0.05
   const isGood = hasDelta && ((deltaGoodDirection === 'up' && isUp) || (deltaGoodDirection === 'down' && isDown))
   const isBad = hasDelta && ((deltaGoodDirection === 'up' && isDown) || (deltaGoodDirection === 'down' && isUp))
 
-  return (
-    <div className="rounded-xl border p-4 sm:p-5 flex flex-col gap-2 min-w-0" style={{ borderColor: 'var(--border)', background: 'var(--surface-1)' }}>
+  const className = 'rounded-xl border p-4 sm:p-5 flex flex-col gap-2 min-w-0 text-left'
+  const style = { borderColor: active ? 'var(--series-1)' : 'var(--border)', background: 'var(--surface-1)' }
+
+  const body = (
+    <>
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium truncate" style={{ color: 'var(--text-secondary)' }}>
           {label}
@@ -39,6 +46,19 @@ export function StatTile({ label, value, sublabel, delta, deltaGoodDirection = '
         )}
         {sublabel && <span style={{ color: 'var(--text-muted)' }}>{sublabel}</span>}
       </div>
+    </>
+  )
+
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} aria-pressed={active} title={actionLabel} className={`${className} cursor-pointer transition hover:brightness-110`} style={style}>
+        {body}
+      </button>
+    )
+  }
+  return (
+    <div className={className} style={style}>
+      {body}
     </div>
   )
 }

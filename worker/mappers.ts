@@ -12,12 +12,26 @@ export interface WireCall {
   fromNumber: string
   toName: string
   toNumber: string
+  /** The team member (or shared line) the call belongs to — never the outside party. */
   extension: string
   extensionName: string
+  /** RingCentral extension type of that owner ("User", "Department", …); "" when it couldn't be looked up. */
+  extensionType: string
   durationSeconds: number
   result: string
   recorded: boolean
 }
+
+/** One entry of the account's extension list, keyed by extension id in a `Directory`. */
+export interface DirectoryEntry {
+  name: string
+  extensionNumber: string
+  type: string
+}
+
+export type Directory = Map<string, DirectoryEntry>
+
+const NO_DIRECTORY: Directory = new Map()
 
 export interface WireSms {
   messageId: string
@@ -46,8 +60,43 @@ export interface WireQos {
   longestWaitSec: number
 }
 
-export function mapCall(record: RcRecord, fallbackExt?: RcRecord): WireCall {
-  const ext = record.extension ?? fallbackExt
+const ANSWERED_RESULTS = new Set(['Accepted', 'Call connected'])
+
+/**
+ * Who on the account the call belongs to. A call log record's own `extension` carries
+ * only an id, so the name and number come from the extension directory. The fallbacks
+ * only ever read the account's side of the call (`from` on outbound, `to` on inbound):
+ * the other side is the outside party, whose caller-ID label must not be mistaken for staff.
+ */
+function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecord): DirectoryEntry {
+  const ourSide: RcRecord | undefined = record.direction === 'Outbound' ? record.from : record.to
+  const lookup = (id: unknown) => (id === undefined || id === null ? undefined : directory.get(String(id)))
+
+  let owner = lookup(record.extension?.id) ?? lookup(ourSide?.extensionId)
+
+  // A call to a queue or the main line is owned by that shared extension; credit the
+  // person who actually picked it up, when one of the legs shows a user answering.
+  if (owner?.type !== 'User') {
+    for (const leg of (record.legs ?? []) as RcRecord[]) {
+      const legOwner = lookup(leg.extension?.id)
+      if (legOwner?.type === 'User' && ANSWERED_RESULTS.has(leg.result)) {
+        owner = legOwner
+        break
+      }
+    }
+  }
+  if (owner) return owner
+
+  const inline: RcRecord | undefined = record.extension?.name || record.extension?.extensionNumber ? record.extension : fallbackExt
+  return {
+    name: inline?.name ?? ourSide?.name ?? 'Unassigned',
+    extensionNumber: inline?.extensionNumber ?? ourSide?.extensionNumber ?? '',
+    type: inline?.type ?? '',
+  }
+}
+
+export function mapCall(record: RcRecord, directory: Directory = NO_DIRECTORY, fallbackExt?: RcRecord): WireCall {
+  const owner = callOwner(record, directory, fallbackExt)
   return {
     callId: String(record.id),
     startTime: record.startTime,
@@ -56,12 +105,22 @@ export function mapCall(record: RcRecord, fallbackExt?: RcRecord): WireCall {
     fromNumber: record.from?.phoneNumber ?? record.from?.extensionNumber ?? '',
     toName: record.to?.name ?? '',
     toNumber: record.to?.phoneNumber ?? record.to?.extensionNumber ?? '',
-    extension: ext?.extensionNumber ?? '',
-    extensionName: ext?.name ?? record.to?.name ?? record.from?.name ?? 'Unassigned',
+    extension: owner.extensionNumber,
+    extensionName: owner.name || 'Unassigned',
+    extensionType: owner.type,
     durationSeconds: record.duration ?? 0,
     result: record.result ?? 'Unknown',
     recorded: Boolean(record.recording),
   }
+}
+
+export function mapDirectory(records: RcRecord[]): Directory {
+  const directory: Directory = new Map()
+  for (const r of records) {
+    if (r.id === undefined || r.id === null) continue
+    directory.set(String(r.id), { name: r.name ?? '', extensionNumber: r.extensionNumber ?? '', type: r.type ?? '' })
+  }
+  return directory
 }
 
 export function mapSms(record: RcRecord): WireSms {

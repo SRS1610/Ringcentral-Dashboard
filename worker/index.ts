@@ -9,7 +9,7 @@
 //   GET /api/qos?from&to&page                     queue service quality per day (Business Analytics API)
 
 import { ApiError, RcSession, isForbidden, type Env, type RcRecord } from './ringcentral.ts'
-import { mapCall, mapExtension, mapQosTimeline, mapSms } from './mappers.ts'
+import { mapCall, mapDirectory, mapExtension, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
 
 const CALL_PAGE_SIZE = '1000'
 const SMS_PAGE_SIZE = '1000'
@@ -20,6 +20,10 @@ const QOS_PAGE_SIZE = '20'
 /** Business Analytics keeps roughly the last 184 days. */
 const ANALYTICS_MAX_DAYS = 184
 const DAY_MS = 86_400_000
+/** How long an isolate reuses the extension list it resolves call owners against. */
+const DIRECTORY_TTL_MS = 10 * 60_000
+/** After a failed attempt (e.g. the app lacks Read Accounts), wait this long before asking again. */
+const DIRECTORY_RETRY_MS = 60_000
 
 function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -109,6 +113,48 @@ async function status(rc: RcSession) {
   }
 }
 
+async function listExtensions(rc: RcSession, filter: Record<string, string> = {}): Promise<RcRecord[]> {
+  const all: RcRecord[] = []
+  for (let page = 1; page <= MAX_EXTENSION_PAGES; page++) {
+    const data = await rc.call('/restapi/v1.0/account/~/extension', { params: { ...filter, perPage: EXTENSION_PAGE_SIZE, page: String(page) } })
+    const records: RcRecord[] = data.records ?? []
+    all.push(...records)
+    if (records.length === 0 || !data.navigation?.nextPage) break
+  }
+  return all
+}
+
+// ---- Extension directory ---------------------------------------------------------
+// A call log record names its owner only by extension id, so the calls route resolves
+// ids against the account's extension list. Every status is included: a team member who
+// has since been disabled still owns their past calls.
+
+let directoryMemo: { account: string; expiresAt: number; directory: Directory } | null = null
+
+async function loadDirectory(rc: RcSession): Promise<Directory> {
+  const account = `${rc.creds.serverUrl}|${rc.creds.clientId}`
+  if (directoryMemo && directoryMemo.account === account && Date.now() < directoryMemo.expiresAt) return directoryMemo.directory
+  let directory: Directory
+  let ttl = DIRECTORY_TTL_MS
+  try {
+    directory = mapDirectory(await listExtensions(rc))
+  } catch (e) {
+    // Rate limits are passed on so the browser waits and retries with names intact.
+    // Anything else: carry on without the list rather than failing the call log.
+    if (e instanceof ApiError && e.code === 'rate_limited') throw e
+    console.warn('Extension list unavailable; call owners fall back to the names on each record.', e instanceof Error ? e.message : e)
+    directory = new Map()
+    ttl = DIRECTORY_RETRY_MS
+  }
+  directoryMemo = { account, expiresAt: Date.now() + ttl, directory }
+  return directory
+}
+
+/** For tests: forget the cached extension list. */
+export function resetDirectoryMemo(): void {
+  directoryMemo = null
+}
+
 async function calls(rc: RcSession, url: URL) {
   const { from, to } = windowParams(url)
   const params = { view: 'Detailed', dateFrom: from.toISOString(), dateTo: to.toISOString(), perPage: CALL_PAGE_SIZE, page: String(pageParam(url)) }
@@ -118,7 +164,8 @@ async function calls(rc: RcSession, url: URL) {
     try {
       const data = await rc.call('/restapi/v1.0/account/~/call-log', { params })
       const records: RcRecord[] = data.records ?? []
-      return { records: records.map((r) => mapCall(r)), hasMore: hasMore(data, records.length), scope: 'company' }
+      const directory = records.length > 0 ? await loadDirectory(rc) : new Map()
+      return { records: records.map((r) => mapCall(r, directory)), hasMore: hasMore(data, records.length), scope: 'company' }
     } catch (e) {
       if (!isForbidden(e)) throw e
       // The JWT belongs to a non-admin user: RingCentral only allows that user's own call log.
@@ -127,18 +174,12 @@ async function calls(rc: RcSession, url: URL) {
   const me = await rc.call('/restapi/v1.0/account/~/extension/~')
   const data = await rc.call('/restapi/v1.0/account/~/extension/~/call-log', { params })
   const records: RcRecord[] = data.records ?? []
-  return { records: records.map((r) => mapCall(r, me)), hasMore: hasMore(data, records.length), scope: 'self' }
+  return { records: records.map((r) => mapCall(r, undefined, { type: 'User', ...me })), hasMore: hasMore(data, records.length), scope: 'self' }
 }
 
 async function extensions(rc: RcSession) {
   try {
-    const all: RcRecord[] = []
-    for (let page = 1; page <= MAX_EXTENSION_PAGES; page++) {
-      const data = await rc.call('/restapi/v1.0/account/~/extension', { params: { status: 'Enabled', perPage: EXTENSION_PAGE_SIZE, page: String(page) } })
-      const records: RcRecord[] = data.records ?? []
-      all.push(...records)
-      if (records.length === 0 || !data.navigation?.nextPage) break
-    }
+    const all = await listExtensions(rc, { status: 'Enabled' })
     return { extensions: all.filter((e) => e.type === 'User').map(mapExtension), scope: 'company' }
   } catch (e) {
     if (!isForbidden(e)) throw e

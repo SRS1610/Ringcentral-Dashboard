@@ -8,8 +8,11 @@ export interface CallRecord {
   fromNumber: string
   toName: string
   toNumber: string
+  /** The team member (or shared line) on the account's side of the call. */
   extension: string
   extensionName: string
+  /** RingCentral extension type ("User", "Department", …) when known; absent for CSV data. */
+  extensionType?: string
   department: string
   durationSeconds: number
   result: string

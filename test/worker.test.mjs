@@ -2,7 +2,7 @@
 // Run with `npm test` (Node 22.18+ runs the TypeScript sources directly).
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import worker from '../worker/index.ts'
+import worker, { resetDirectoryMemo } from '../worker/index.ts'
 import { resetTokenMemo } from '../worker/ringcentral.ts'
 
 const RC = 'https://rc.test'
@@ -22,6 +22,7 @@ function reply(body, status = 200, headers = {}) {
 
 beforeEach(() => {
   resetTokenMemo()
+  resetDirectoryMemo()
   calls = []
   routes = {
     'POST /restapi/oauth/token': () => reply({ access_token: 'tok-1', expires_in: 3600 }),
@@ -168,6 +169,7 @@ test('calls: one page, mapped, with paging and the requested window', async () =
         toNumber: '+15550002',
         extension: '101',
         extensionName: 'Ada Admin',
+        extensionType: '',
         durationSeconds: 65,
         result: 'Call connected',
         recorded: true,
@@ -182,6 +184,83 @@ test('calls: one page, mapped, with paging and the requested window', async () =
   assert.equal(rcCall.init.headers.Authorization, 'Bearer tok-1')
 })
 
+const DIRECTORY = {
+  records: [
+    { id: 11, type: 'User', name: 'Ada Admin', extensionNumber: '101' },
+    { id: 12, type: 'Department', name: 'Support queue', extensionNumber: '200' },
+    { id: 13, type: 'User', name: 'Ben Agent', extensionNumber: '102' },
+  ],
+}
+
+test('calls: the owner is the team member from the extension list, never the outside party', async () => {
+  routes['GET /restapi/v1.0/account/~/extension'] = () => reply(DIRECTORY)
+  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
+    reply({
+      records: [
+        // Outbound: `to` is the outside party. Its caller-ID label must not become the agent.
+        { id: 'o1', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound', from: { name: 'Ada Admin' }, to: { name: 'CHICAGO IL', phoneNumber: '+13125550100' }, extension: { id: 11, uri: 'x' } },
+        // Inbound to a number with no name and no known extension: nobody owns it.
+        { id: 'i1', startTime: '2026-09-02T02:00:00Z', direction: 'Inbound', from: { name: 'Possible spam call', phoneNumber: '+17025550100' }, to: { phoneNumber: '+18005550100' }, result: 'Missed' },
+        // Inbound to a queue, picked up by a user on one of the legs.
+        {
+          id: 'i2',
+          startTime: '2026-09-02T03:00:00Z',
+          direction: 'Inbound',
+          from: { name: 'LAS VEGAS NV', phoneNumber: '+17025550101' },
+          to: { name: 'Support queue', phoneNumber: '+18005550100' },
+          extension: { id: 12 },
+          result: 'Accepted',
+          legs: [
+            { extension: { id: 12 }, result: 'Accepted' },
+            { extension: { id: 11 }, result: 'Missed' },
+            { extension: { id: 13 }, result: 'Accepted' },
+          ],
+        },
+        // Inbound to a queue that nobody answered stays with the queue.
+        { id: 'i3', startTime: '2026-09-02T04:00:00Z', direction: 'Inbound', from: { name: 'NEVADA', phoneNumber: '+17025550102' }, to: { name: 'Support queue' }, extension: { id: 12 }, result: 'Missed', legs: [{ extension: { id: 13 }, result: 'Missed' }] },
+        // No record-level extension, but the account's side of the call names one.
+        { id: 'o2', startTime: '2026-09-02T05:00:00Z', direction: 'Outbound', from: { extensionId: '13', name: 'Somebody' }, to: { name: 'VA', phoneNumber: '+18005550199' } },
+      ],
+    })
+  const body = await (await api(`/api/calls?${WINDOW}`)).json()
+  const owners = body.records.map((r) => [r.callId, r.extensionName, r.extension, r.extensionType])
+  assert.deepEqual(owners, [
+    ['o1', 'Ada Admin', '101', 'User'],
+    ['i1', 'Unassigned', '', ''],
+    ['i2', 'Ben Agent', '102', 'User'],
+    ['i3', 'Support queue', '200', 'Department'],
+    ['o2', 'Ben Agent', '102', 'User'],
+  ])
+  // The outside party is still reported, as the caller.
+  assert.equal(body.records[0].toName, 'CHICAGO IL')
+  assert.equal(body.records[1].fromName, 'Possible spam call')
+
+  const listRequest = calls.find((c) => c.key === 'GET /restapi/v1.0/account/~/extension')
+  assert.equal(listRequest.url.searchParams.get('status'), null, 'disabled users are included so their past calls resolve')
+})
+
+test('calls: the extension list is fetched once per isolate, and a failure there does not fail the call log', async () => {
+  const record = { id: 'o1', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound', from: { name: 'Ada Admin' }, to: { name: 'CHICAGO IL' }, extension: { id: 11 } }
+  routes['GET /restapi/v1.0/account/~/call-log'] = () => reply({ records: [record] })
+
+  // No mock for the extension list yet: RingCentral answers 404.
+  const withoutList = await (await api(`/api/calls?${WINDOW}`)).json()
+  assert.equal(withoutList.records[0].extensionName, 'Ada Admin', 'falls back to the account side of the call')
+
+  resetDirectoryMemo()
+  routes['GET /restapi/v1.0/account/~/extension'] = () => reply(DIRECTORY)
+  calls = []
+  await api(`/api/calls?${WINDOW}`)
+  await api(`/api/calls?${WINDOW}&page=2`)
+  assert.equal(calls.filter((c) => c.key === 'GET /restapi/v1.0/account/~/extension').length, 1)
+
+  resetDirectoryMemo()
+  routes['GET /restapi/v1.0/account/~/extension'] = () => reply({ message: 'Request rate exceeded' }, 429, { 'Retry-After': '7' })
+  const limited = await api(`/api/calls?${WINDOW}`)
+  assert.equal(limited.status, 429)
+  assert.equal(limited.headers.get('Retry-After'), '7')
+})
+
 test('calls: a non-admin JWT falls back to that user’s own call log', async () => {
   routes['GET /restapi/v1.0/account/~/call-log'] = () => reply({ errorCode: 'CMN-408', message: 'In order to call this API endpoint, user needs to have [ReadCompanyCallLog] permission' }, 403)
   routes['GET /restapi/v1.0/account/~/extension/~/call-log'] = () => reply({ records: [{ id: 'c9', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound' }] })
@@ -189,6 +268,7 @@ test('calls: a non-admin JWT falls back to that user’s own call log', async ()
   assert.equal(body.scope, 'self')
   assert.equal(body.records[0].extension, '101')
   assert.equal(body.records[0].extensionName, 'Ada Admin')
+  assert.equal(body.records[0].extensionType, 'User')
 
   calls = []
   await api(`/api/calls?${WINDOW}&page=2&scope=self`)

@@ -24,10 +24,12 @@ export function pctDelta(current: number, previous: number): number | null {
 
 // ---- Calls ---------------------------------------------------------------
 
+const MISSED_RESULTS = new Set(['Missed', 'Rejected', 'Busy'])
+
 export function callKpis(calls: CallRecord[]) {
   const total = calls.length
   const connected = calls.filter((c) => c.result === 'Call connected')
-  const missed = calls.filter((c) => c.result === 'Missed' || c.result === 'Rejected' || c.result === 'Busy')
+  const missed = calls.filter((c) => MISSED_RESULTS.has(c.result))
   const answerRate = total > 0 ? (connected.length / total) * 100 : 0
   const avgDuration = connected.length > 0 ? connected.reduce((s, c) => s + c.durationSeconds, 0) / connected.length : 0
   const inbound = calls.filter((c) => c.direction === 'Inbound').length
@@ -85,16 +87,33 @@ export function departmentLeaderboard(calls: CallRecord[]): DeptLeaderboardRow[]
 
 export interface AgentLeaderboardRow {
   extensionName: string
+  extension: string
   department: string
+  /** True for a person; false for a queue, main line or other shared extension, and for calls nobody owns. */
+  isStaff: boolean
   total: number
+  inbound: number
+  outbound: number
+  connected: number
+  missed: number
+  voicemail: number
   answerRate: number
   avgDuration: number
+  talkSeconds: number
+}
+
+const UNASSIGNED = 'Unassigned'
+
+/** Live data says what kind of extension owns a call; CSV data only has a name, which is taken as a person. */
+function isStaffCall(c: CallRecord): boolean {
+  if (c.extensionType) return c.extensionType === 'User'
+  return Boolean(c.extensionName) && c.extensionName !== UNASSIGNED
 }
 
 export function agentLeaderboard(calls: CallRecord[]): AgentLeaderboardRow[] {
   const map = new Map<string, CallRecord[]>()
   for (const c of calls) {
-    const key = c.extensionName
+    const key = c.extensionName || UNASSIGNED
     const arr = map.get(key) ?? []
     arr.push(c)
     map.set(key, arr)
@@ -102,15 +121,125 @@ export function agentLeaderboard(calls: CallRecord[]): AgentLeaderboardRow[] {
   return [...map.entries()]
     .map(([extensionName, records]) => {
       const connected = records.filter((r) => r.result === 'Call connected')
+      const talkSeconds = connected.reduce((s, r) => s + r.durationSeconds, 0)
+      const inbound = records.filter((r) => r.direction === 'Inbound').length
       return {
         extensionName,
-        department: records[0]?.department ?? 'Unassigned',
+        extension: records.find((r) => r.extension)?.extension ?? '',
+        department: records[0]?.department ?? UNASSIGNED,
+        isStaff: records.some(isStaffCall),
         total: records.length,
+        inbound,
+        outbound: records.length - inbound,
+        connected: connected.length,
+        missed: records.filter((r) => r.result === 'Missed').length,
+        voicemail: records.filter((r) => r.result === 'Voicemail').length,
         answerRate: records.length > 0 ? (connected.length / records.length) * 100 : 0,
-        avgDuration: connected.length > 0 ? connected.reduce((s, r) => s + r.durationSeconds, 0) / connected.length : 0,
+        avgDuration: connected.length > 0 ? talkSeconds / connected.length : 0,
+        talkSeconds,
       }
     })
     .sort((a, b) => b.total - a.total)
+}
+
+// ---- Callers behind a metric ---------------------------------------------------
+
+/** A headline metric, or `result:<name>` for one bar of the call outcomes chart. */
+export type CallMetricKey = 'all' | 'inbound' | 'outbound' | 'connected' | 'missed' | 'voicemail' | `result:${string}`
+
+const RESULT_PRESETS: Record<string, CallMetricKey> = { 'Call connected': 'connected', Missed: 'missed', Voicemail: 'voicemail' }
+
+/** The metric for one call result, as shown in the call outcomes chart. */
+export const metricForResult = (result: string): CallMetricKey => RESULT_PRESETS[result] ?? `result:${result}`
+
+/** The call result a metric stands for, if it is exactly one. */
+export function resultForMetric(key: CallMetricKey): string | null {
+  if (key.startsWith('result:')) return key.slice('result:'.length)
+  return Object.keys(RESULT_PRESETS).find((result) => RESULT_PRESETS[result] === key) ?? null
+}
+
+export function callMetricLabel(key: CallMetricKey): string {
+  switch (key) {
+    case 'all':
+      return 'All calls'
+    case 'inbound':
+      return 'Inbound'
+    case 'outbound':
+      return 'Outbound'
+    case 'connected':
+      return 'Connected'
+    case 'missed':
+      return 'Missed'
+    case 'voicemail':
+      return 'Voicemail'
+    default:
+      return key.slice('result:'.length)
+  }
+}
+
+/** The calls a metric counts, using the same definitions as `callKpis`. */
+export function callsForMetric(calls: CallRecord[], key: CallMetricKey): CallRecord[] {
+  switch (key) {
+    case 'all':
+      return calls
+    case 'inbound':
+      return calls.filter((c) => c.direction === 'Inbound')
+    case 'outbound':
+      return calls.filter((c) => c.direction === 'Outbound')
+    case 'connected':
+      return calls.filter((c) => c.result === 'Call connected')
+    case 'missed':
+      return calls.filter((c) => c.result === 'Missed')
+    case 'voicemail':
+      return calls.filter((c) => c.result === 'Voicemail')
+    default: {
+      const result = key.slice('result:'.length)
+      return calls.filter((c) => c.result === result)
+    }
+  }
+}
+
+export interface CallerRow {
+  key: string
+  /** Caller-ID name of the outside party; empty when RingCentral had none. */
+  name: string
+  number: string
+  total: number
+  inbound: number
+  outbound: number
+  talkSeconds: number
+  lastCall: Date
+  /** Team members on these calls, most frequent first. */
+  staff: string[]
+}
+
+const mostCommon = (counts: Map<string, number>): string[] => [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([name]) => name)
+
+/** Groups calls by the outside party: who called in, or who was called. */
+export function callerBreakdown(calls: CallRecord[]): CallerRow[] {
+  interface Acc extends Omit<CallerRow, 'name' | 'staff'> {
+    names: Map<string, number>
+    staff: Map<string, number>
+  }
+  const map = new Map<string, Acc>()
+  for (const c of calls) {
+    const inbound = c.direction === 'Inbound'
+    const number = (inbound ? c.fromNumber : c.toNumber).trim()
+    const name = (inbound ? c.fromName : c.toName).trim()
+    const key = number || (name ? `name:${name.toLowerCase()}` : 'unknown')
+    const row = map.get(key) ?? { key, number, total: 0, inbound: 0, outbound: 0, talkSeconds: 0, lastCall: c.startTime, names: new Map(), staff: new Map() }
+    row.total += 1
+    if (inbound) row.inbound += 1
+    else row.outbound += 1
+    row.talkSeconds += c.durationSeconds
+    if (c.startTime > row.lastCall) row.lastCall = c.startTime
+    if (name) row.names.set(name, (row.names.get(name) ?? 0) + 1)
+    if (isStaffCall(c)) row.staff.set(c.extensionName, (row.staff.get(c.extensionName) ?? 0) + 1)
+    map.set(key, row)
+  }
+  return [...map.values()]
+    .map(({ names, staff, ...row }) => ({ ...row, name: mostCommon(names)[0] ?? '', staff: mostCommon(staff) }))
+    .sort((a, b) => b.total - a.total || b.lastCall.getTime() - a.lastCall.getTime())
 }
 
 const HOUR_BUCKETS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]

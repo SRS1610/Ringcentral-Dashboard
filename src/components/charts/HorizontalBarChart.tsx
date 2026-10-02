@@ -13,9 +13,12 @@ interface HorizontalBarChartProps {
   colors?: string[]
   valueFormatter?: (v: number) => string
   height?: number
+  /** Called with the bar's name when a bar is clicked. */
+  onSelect?: (name: string) => void
+  selected?: string | null
 }
 
-export function HorizontalBarChart({ data, color = 'var(--series-1)', colors, valueFormatter, height }: HorizontalBarChartProps) {
+export function HorizontalBarChart({ data, color = 'var(--series-1)', colors, valueFormatter, height, onSelect, selected }: HorizontalBarChartProps) {
   const fmt = valueFormatter ?? ((v: number) => v.toLocaleString())
   const chartHeight = height ?? Math.max(140, data.length * 34)
 
@@ -42,9 +45,15 @@ export function HorizontalBarChart({ data, color = 'var(--series-1)', colors, va
             return <TooltipShell title={name} rows={[{ label: 'Value', value: fmt(val), color: colors ? String(p.payload.fill) : color }]} />
           }}
         />
-        <Bar dataKey="value" radius={[0, 4, 4, 0]} maxBarSize={20}>
+        <Bar
+          dataKey="value"
+          radius={[0, 4, 4, 0]}
+          maxBarSize={20}
+          cursor={onSelect ? 'pointer' : undefined}
+          onClick={onSelect ? (entry) => onSelect(String((entry as { name?: unknown }).name ?? '')) : undefined}
+        >
           {data.map((d, i) => (
-            <Cell key={d.name} fill={colors ? colors[i % colors.length] : color} />
+            <Cell key={d.name} fill={colors ? colors[i % colors.length] : color} fillOpacity={selected && selected !== d.name ? 0.4 : 1} />
           ))}
         </Bar>
       </BarChart>
