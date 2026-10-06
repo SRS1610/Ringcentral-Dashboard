@@ -1,4 +1,6 @@
 import { useMemo } from 'react'
+import { useData } from '../state/DataContext'
+import { PerformanceReport } from './PerformanceReport'
 import { useFilteredData } from '../state/useFilteredData'
 import { StatTile } from '../components/ui/StatTile'
 import { ChartCard } from '../components/ui/ChartCard'
@@ -8,7 +10,7 @@ import { ChartLegend } from '../components/charts/ChartLegend'
 import { HorizontalBarChart } from '../components/charts/HorizontalBarChart'
 import { StatusBadge } from '../components/ui/Badge'
 import { pctDelta, qosByQueue, qosDailyTrend, qosKpis } from '../lib/metrics'
-import { formatNumber, formatPercent } from '../lib/format'
+import { compareLabel, formatNumber, formatPercent } from '../lib/format'
 
 const TARGET_SL = 85
 
@@ -18,8 +20,39 @@ function slStatus(sl: number): 'good' | 'warning' | 'critical' {
   return 'critical'
 }
 
+/**
+ * Two views of service, each shown when RingCentral Analytics has data for it: the per-user
+ * performance report (every account), and service level per call queue (accounts with queues).
+ */
 export function ServiceQuality() {
-  const { qosInRange, qosPrior, loading } = useFilteredData()
+  const { perf, qos } = useData()
+  const { loading } = useFilteredData()
+  const hasPerf = perf.records.length > 0
+  const hasQos = qos.records.length > 0
+
+  if (loading) {
+    return <div className="text-sm py-12 text-center" style={{ color: 'var(--text-muted)' }}>Loading service quality data&hellip;</div>
+  }
+
+  return (
+    <div className="flex flex-col gap-8">
+      {hasPerf && <PerformanceReport />}
+      {hasQos && (
+        <section className="flex flex-col gap-3">
+          {hasPerf && (
+            <h2 className="text-base font-semibold" style={{ color: 'var(--text-primary)' }}>
+              Call queues
+            </h2>
+          )}
+          <QueueQuality />
+        </section>
+      )}
+    </div>
+  )
+}
+
+function QueueQuality() {
+  const { qosInRange, qosPrior } = useFilteredData()
 
   const kpis = useMemo(() => {
     const cur = qosKpis(qosInRange)
@@ -41,35 +74,33 @@ export function ServiceQuality() {
   const trend = useMemo(() => qosDailyTrend(qosInRange), [qosInRange])
   const byQueue = useMemo(() => qosByQueue(qosInRange), [qosInRange])
 
-  if (loading) {
-    return <div className="text-sm py-12 text-center" style={{ color: 'var(--text-muted)' }}>Loading service quality data&hellip;</div>
-  }
+  const compare = compareLabel(qosPrior.length > 0)
 
   return (
     <div className="flex flex-col gap-5">
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-        <StatTile label="Calls offered" value={formatNumber(kpis.offered)} delta={kpis.offeredDelta} sublabel="vs prior period" />
+        <StatTile label="Calls offered" value={formatNumber(kpis.offered)} delta={kpis.offeredDelta} sublabel={compare} />
         <StatTile label="Service level" value={formatPercent(kpis.serviceLevel)} delta={kpis.serviceLevelDelta} sublabel="target 85%" />
         <StatTile
           label="Abandon rate"
           value={formatPercent(kpis.abandonRate, 1)}
           delta={kpis.abandonRateDelta}
           deltaGoodDirection="down"
-          sublabel="vs prior period"
+          sublabel={compare}
         />
         <StatTile
           label="Avg speed of answer"
           value={`${Math.round(kpis.avgSpeedAnswer)}s`}
           delta={kpis.avgSpeedAnswerDelta}
           deltaGoodDirection="down"
-          sublabel="vs prior period"
+          sublabel={compare}
         />
         <StatTile
           label="Avg handle time"
           value={`${Math.round(kpis.avgHandleTime / 60)}m ${Math.round(kpis.avgHandleTime % 60)}s`}
           delta={kpis.avgHandleTimeDelta}
           deltaGoodDirection="down"
-          sublabel="vs prior period"
+          sublabel={compare}
         />
       </div>
 

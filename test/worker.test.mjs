@@ -491,6 +491,122 @@ test('qos: an account without Analytics access gets a clear error', async () => 
   assert.match((await res.json()).message, /\[Analytics\] permission/)
 })
 
+test('performance: the per-user timeline becomes one row per user per day', async () => {
+  routes['GET /restapi/v1.0/account/~/extension'] = () =>
+    reply({ records: [{ id: 11, type: 'User', name: 'Ada Admin', extensionNumber: '101', contact: { department: 'Intake' } }] })
+  const point = (time, calls, extra = {}) => ({
+    time,
+    counters: {
+      allCalls: { valueType: 'Instances', values: calls },
+      callsByDirection: { valueType: 'Instances', values: { inbound: 4, outbound: calls - 4 } },
+      callsByResponse: { valueType: 'Instances', values: { answered: 1, notAnswered: 3, connected: calls - 5, notConnected: 1 } },
+      callsByResult: { valueType: 'Instances', values: { completed: calls - 4, abandoned: 0, voicemail: 2, missed: 1, accepted: 0, unknown: 0 } },
+      callsByCompanyHours: { valueType: 'Instances', values: { businessHours: calls - 2, afterHours: 2 } },
+      callsActions: { valueType: 'Instances', values: { holdOn: 3, holdOff: 3, parkOn: 0, parkOff: 0, blindTransfer: 1, warmTransfer: 1, dtmfTransfer: 0 } },
+      ...extra,
+    },
+    timers: {
+      allCalls: { valueType: 'Seconds', values: 6000.4 },
+      callsSegments: { valueType: 'Seconds', values: { ringing: 120, liveTalk: 5400, hold: 90, ivrPrompt: 0, voicemail: 60 } },
+    },
+  })
+  const requests = []
+  routes['POST /analytics/calls/v1/accounts/~/timeline/fetch'] = (url, init) => {
+    requests.push({ body: JSON.parse(init.body), page: url.searchParams.get('page'), interval: url.searchParams.get('interval'), perPage: url.searchParams.get('perPage') })
+    return reply({
+      paging: { page: 2, perPage: 20, totalPages: 3, totalElements: 45 },
+      data: {
+        groupedBy: 'Users',
+        records: [
+          {
+            key: '11',
+            info: { name: 'Ada Admin', extensionNumber: '101' },
+            points: [
+              point('2026-09-01T07:00:00.000Z', 20),
+              point('2026-09-02T07:00:00.000Z', 0), // a day with no calls: no row
+              { time: '2026-09-03T07:00:00.000Z' }, // a bare day: no row, and nothing to report
+              { time: '2026-09-04T07:00:00.000Z', counters: { somethingNew: { values: 3 } } }, // unreadable: reported
+            ],
+          },
+          // A user the extension list doesn't know still gets a row, named from the report itself.
+          { key: '77', info: { extensionNumber: '177' }, points: [point('2026-09-01T07:00:00.000Z', 6)] },
+        ],
+      },
+    })
+  }
+
+  const res = await api(`/api/performance?from=2026-09-01T07:00:00Z&to=2026-09-05T06:59:59.999Z&page=2&timeZone=America/Los_Angeles`)
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  assert.deepEqual(body.records, [
+    {
+      date: '2026-09-01T07:00:00.000Z',
+      key: '11',
+      name: 'Ada Admin',
+      extensionNumber: '101',
+      department: 'Intake',
+      calls: 20,
+      inbound: 4,
+      outbound: 16,
+      answered: 1,
+      notAnswered: 3,
+      connected: 15,
+      notConnected: 1,
+      missed: 1,
+      voicemail: 2,
+      abandoned: 0,
+      businessHours: 18,
+      afterHours: 2,
+      holds: 3,
+      transfers: 2,
+      totalSec: 6000,
+      ringSec: 120,
+      talkSec: 5400,
+      holdSec: 90,
+    },
+    { ...body.records[0], key: '77', name: '177', extensionNumber: '177', department: '', calls: 6, outbound: 2, connected: 1, businessHours: 4 },
+  ])
+  assert.deepEqual([body.users, body.unrecognised, body.hasMore, body.clampedToDays, body.timeZone], [2, 1, true, null, 'America/Los_Angeles'])
+
+  assert.equal(requests.length, 1)
+  const [request] = requests
+  assert.deepEqual([request.interval, request.perPage, request.page], ['Day', '20', '2'])
+  assert.deepEqual(request.body.grouping, { groupBy: 'Users' })
+  assert.deepEqual(request.body.timeSettings, { timeZone: 'America/Los_Angeles', timeRange: { timeFrom: '2026-09-01T07:00:00.000Z', timeTo: '2026-09-05T06:59:59.999Z' } })
+  assert.equal(request.body.responseOptions.counters.callsByResponse, true)
+  assert.equal(request.body.responseOptions.timers.callsSegmentsDuration, true)
+})
+
+test('performance: a time zone RingCentral rejects falls back to UTC; a malformed one is never sent', async () => {
+  const zones = []
+  routes['POST /analytics/calls/v1/accounts/~/timeline/fetch'] = (url, init) => {
+    const zone = JSON.parse(init.body).timeSettings.timeZone
+    zones.push(zone)
+    if (zone !== 'UTC') return reply({ errorCode: 'CMN-101', message: 'Parameter [timeZone] value is invalid' }, 400)
+    return reply({ paging: { totalPages: 1 }, data: { groupedBy: 'Users', records: [] } })
+  }
+  const fallback = await (await api(`/api/performance?${WINDOW}&timeZone=Asia/Calcutta`)).json()
+  assert.deepEqual(zones, ['Asia/Calcutta', 'UTC'])
+  assert.deepEqual([fallback.timeZone, fallback.users, fallback.hasMore], ['UTC', 0, false])
+
+  zones.length = 0
+  await api(`/api/performance?${WINDOW}&timeZone=${encodeURIComponent('"; drop')}`)
+  assert.deepEqual(zones, ['UTC'])
+})
+
+test('performance: a window older than Analytics keeps is answered empty without calling RingCentral', async () => {
+  const body = await (await api('/api/performance?from=2020-01-01T00:00:00Z&to=2020-02-01T00:00:00Z')).json()
+  assert.deepEqual([body.records, body.hasMore, body.clampedToDays], [[], false, 184])
+  assert.ok(!calls.some((c) => c.key.includes('/analytics/')))
+})
+
+test('performance: an account without Analytics access gets a clear error', async () => {
+  routes['POST /analytics/calls/v1/accounts/~/timeline/fetch'] = () => reply({ errorCode: 'CMN-408', message: 'In order to call this API endpoint, application needs to have [Analytics] permission' }, 403)
+  const res = await api(`/api/performance?${WINDOW}`)
+  assert.equal(res.status, 403)
+  assert.equal((await res.json()).error, 'ringcentral_forbidden')
+})
+
 test('only GET is accepted', async () => {
   const res = await worker.fetch(new Request('https://dash.test/api/status', { method: 'POST', headers: { Authorization: 'Bearer open-sesame' } }), env)
   assert.equal(res.status, 405)

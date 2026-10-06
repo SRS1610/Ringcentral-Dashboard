@@ -1,4 +1,4 @@
-import type { CallKind, CallRecord, DateRange, QosRecord, SmsRecord } from '../types'
+import type { CallKind, CallRecord, DateRange, PerformanceRecord, QosRecord, SmsRecord } from '../types'
 import { formatDateKey } from './format.ts'
 import { zonedDateKey, zonedParts } from './timezone.ts'
 
@@ -421,6 +421,95 @@ export function qosByQueue(qos: QosRecord[]) {
       }
     })
     .sort((a, b) => b.offered - a.offered)
+}
+
+// ---- Performance report (RingCentral Analytics, per user) -------------------------
+// Analytics counts a call once for every user it touched, so user rows can add up to more
+// than the number of calls the company handled. Rates and averages are unaffected.
+
+const PERF_SUMS = [
+  'calls',
+  'inbound',
+  'outbound',
+  'answered',
+  'notAnswered',
+  'connected',
+  'notConnected',
+  'missed',
+  'voicemail',
+  'abandoned',
+  'businessHours',
+  'afterHours',
+  'holds',
+  'transfers',
+  'totalSec',
+  'ringSec',
+  'talkSec',
+  'holdSec',
+] as const
+
+type PerfSums = Record<(typeof PERF_SUMS)[number], number>
+
+export interface PerformanceTotals extends PerfSums {
+  /** Share of inbound calls that were answered; inbound here is answered + not answered. */
+  answerRate: number
+  /** Share of outbound calls that connected. */
+  connectRate: number
+  /** Seconds talking per call that was answered or connected. */
+  avgTalkSec: number
+  /** Seconds ringing per call, either direction. */
+  avgRingSec: number
+  /** Share of calls outside the company's business hours as set in RingCentral. */
+  afterHoursShare: number
+}
+
+function sumPerformance(records: PerformanceRecord[]): PerformanceTotals {
+  const t = Object.fromEntries(PERF_SUMS.map((k) => [k, 0])) as PerfSums
+  for (const r of records) for (const k of PERF_SUMS) t[k] += r[k]
+  const handled = t.answered + t.connected
+  return {
+    ...t,
+    answerRate: rate(t.answered, t.answered + t.notAnswered),
+    connectRate: rate(t.connected, t.connected + t.notConnected),
+    avgTalkSec: handled > 0 ? t.talkSec / handled : 0,
+    avgRingSec: t.calls > 0 ? t.ringSec / t.calls : 0,
+    afterHoursShare: rate(t.afterHours, t.businessHours + t.afterHours),
+  }
+}
+
+export const performanceKpis = (records: PerformanceRecord[]): PerformanceTotals => sumPerformance(records)
+
+export interface PerformanceUserRow extends PerformanceTotals {
+  key: string
+  extensionName: string
+  extension: string
+  department: string
+}
+
+/** One row per user over the whole range, busiest first: the Performance Report table. */
+export function performanceByUser(records: PerformanceRecord[]): PerformanceUserRow[] {
+  const groups = new Map<string, PerformanceRecord[]>()
+  for (const r of records) {
+    const arr = groups.get(r.key) ?? []
+    arr.push(r)
+    groups.set(r.key, arr)
+  }
+  return [...groups.entries()]
+    .map(([key, rows]) => ({ key, extensionName: rows[0].extensionName, extension: rows[0].extension, department: rows[0].department, ...sumPerformance(rows) }))
+    .sort((a, b) => b.calls - a.calls || a.extensionName.localeCompare(b.extensionName))
+}
+
+/** Inbound calls answered and not answered per day, across all users. */
+export function performanceDailyTrend(records: PerformanceRecord[]) {
+  const map = new Map<string, { date: string; answered: number; notAnswered: number; calls: number }>()
+  for (const r of records) {
+    const entry = map.get(r.day) ?? { date: r.day, answered: 0, notAnswered: 0, calls: 0 }
+    entry.answered += r.answered
+    entry.notAnswered += r.notAnswered
+    entry.calls += r.calls
+    map.set(r.day, entry)
+  }
+  return [...map.values()].sort((a, b) => a.date.localeCompare(b.date))
 }
 
 // ---- SMS -------------------------------------------------------------------

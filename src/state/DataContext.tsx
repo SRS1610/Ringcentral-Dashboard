@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import type { CallRecord, DatasetSource, DateRange, DateRangePreset, QosRecord, SmsRecord } from '../types'
+import type { CallRecord, DatasetSource, DateRange, DateRangePreset, PerformanceRecord, QosRecord, SmsRecord } from '../types'
 import { parseCallLogCsv, parseQosCsv, parseSmsCsv } from '../lib/parsers'
 import { browserTimeZone, isValidTimeZone, zonedDayStart, zonedMonthStart } from '../lib/timezone'
 
@@ -20,12 +20,15 @@ interface DataContextValue {
   calls: DatasetState<CallRecord>
   qos: DatasetState<QosRecord>
   sms: DatasetState<SmsRecord>
+  /** Per-user figures from RingCentral Analytics. Live only: there is no file or upload for it. */
+  perf: DatasetState<PerformanceRecord>
   loadCallsFile: (file: File) => Promise<void>
   loadQosFile: (file: File) => Promise<void>
   loadSmsFile: (file: File) => Promise<void>
   setCallsFromRingCentral: (records: CallRecord[], label: string, coveredFrom: Date) => void
   setSmsFromRingCentral: (records: SmsRecord[], label: string, coveredFrom: Date) => void
   setQosFromRingCentral: (records: QosRecord[], label: string, coveredFrom: Date) => void
+  setPerfFromRingCentral: (records: PerformanceRecord[], label: string, coveredFrom: Date) => void
   /** Drops uploads and browser imports, going back to the data files published with the site. */
   resetToSiteData: () => Promise<void>
   range: DateRange | null
@@ -86,6 +89,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [calls, setCalls] = useState<DatasetState<CallRecord>>(initial<CallRecord>())
   const [qos, setQos] = useState<DatasetState<QosRecord>>(initial<QosRecord>())
   const [sms, setSms] = useState<DatasetState<SmsRecord>>(initial<SmsRecord>())
+  const [perf, setPerf] = useState<DatasetState<PerformanceRecord>>({ ...initial<PerformanceRecord>(), loading: false })
   const [preset, setPreset] = useState<DateRangePreset>('30d')
   const [customRange, setCustomRangeState] = useState<DateRange | null>(null)
   const [timeZoneChoice, setTimeZoneChoiceState] = useState<string | null>(() => loadTimeZoneChoice())
@@ -122,6 +126,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setCalls(markLoading)
     setQos(markLoading)
     setSms(markLoading)
+    // The performance report has no data file; going back to the site's data means dropping it.
+    if (replaceExisting) setPerf({ ...initial<PerformanceRecord>(), loading: false })
     try {
       const [callText, qosText, smsText] = await Promise.all([
         fetch(`${import.meta.env.BASE_URL}data/call-log.csv`).then((r) => r.text()),
@@ -194,6 +200,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setQos({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
   }, [])
 
+  const setPerfFromRingCentral = useCallback((records: PerformanceRecord[], label: string, coveredFrom: Date) => {
+    setPerf({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
+  }, [])
+
   const dataBounds = useMemo(() => {
     const dates = [...calls.records.map((c) => c.startTime), ...qos.records.map((q) => q.date), ...sms.records.map((s) => s.dateTime)]
     return computeBounds(dates)
@@ -208,12 +218,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
     calls,
     qos,
     sms,
+    perf,
     loadCallsFile,
     loadQosFile,
     loadSmsFile,
     setCallsFromRingCentral,
     setSmsFromRingCentral,
     setQosFromRingCentral,
+    setPerfFromRingCentral,
     resetToSiteData,
     range,
     preset,

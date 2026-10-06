@@ -13,7 +13,7 @@ import { TeamPerformance } from './sections/TeamPerformance'
 import { Settings } from './sections/Settings'
 
 type DashboardSection = Exclude<SectionKey, 'settings'>
-type DatasetKey = 'calls' | 'qos' | 'sms'
+type DatasetKey = 'calls' | 'qos' | 'sms' | 'perf'
 
 /** Which datasets each tab reads, and what to say when none of them has any rows. */
 const NEEDS: Record<DashboardSection, { datasets: DatasetKey[]; title: string; body: string }> = {
@@ -28,9 +28,9 @@ const NEEDS: Record<DashboardSection, { datasets: DatasetKey[]; title: string; b
     body: 'Unlock live data in Settings to import the call log from RingCentral, or upload a RingCentral Call Log Report export.',
   },
   quality: {
-    datasets: ['qos'],
+    datasets: ['qos', 'perf'],
     title: 'No service quality data yet',
-    body: 'Service level, abandon rate and speed of answer come from RingCentral Analytics for your call queues. Unlock live data in Settings, or upload an Analytics Portal export.',
+    body: 'This tab shows the RingCentral Analytics performance report: how each person’s calls were answered, and talk, ring and hold times. Accounts with call queues also get service level and abandon rate. Both need live data and the Analytics permission on the RingCentral app.',
   },
   messaging: {
     datasets: ['sms'],

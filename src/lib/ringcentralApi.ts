@@ -1,8 +1,9 @@
-import type { CallRecord, QosRecord, SmsRecord } from '../types'
+import type { CallRecord, PerformanceRecord, QosRecord, SmsRecord } from '../types'
 import type { DepartmentMap } from './departmentMap'
 import { departmentFor } from './departmentMap'
 import { ApiError, apiGet, type StatusCallback } from './dashboardApi'
 import { callKindOf } from './metrics'
+import { analyticsDay } from './timezone'
 
 export type { StatusCallback } from './dashboardApi'
 
@@ -164,4 +165,61 @@ export async function syncQos(window: SyncWindow, onStatus?: StatusCallback): Pr
     if (!data.hasMore) break
   }
   return { records, skippedNoSla, clampedToDays }
+}
+
+// ---- Performance report (RingCentral Business Analytics API, per user) ------------
+
+type WirePerformance = Omit<PerformanceRecord, 'date' | 'day' | 'extensionName' | 'extension'> & {
+  date: string
+  name: string
+  extensionNumber: string
+}
+
+interface PerformancePage {
+  records: WirePerformance[]
+  unrecognised: number
+  users: number
+  hasMore: boolean
+  clampedToDays: number | null
+  /** The zone RingCentral bucketed days in: the one asked for, or UTC if it wouldn't take that. */
+  timeZone: string
+}
+
+export interface PerformanceSyncResult {
+  records: PerformanceRecord[]
+  /** Users RingCentral reported on, with or without calls. */
+  users: number
+  /** Points whose counters the dashboard couldn't read; above zero means RingCentral changed the report's shape. */
+  unrecognised: number
+  clampedToDays: number | null
+  timeZone: string
+}
+
+/** Each user's calls per day in `timeZone`, the way the Analytics Portal's Performance Report counts them. */
+export async function syncPerformance(deptMap: DepartmentMap, window: SyncWindow, timeZone: string, onStatus?: StatusCallback): Promise<PerformanceSyncResult> {
+  const range = windowParams(window)
+  const records: PerformanceRecord[] = []
+  let users = 0
+  let unrecognised = 0
+  let clampedToDays: number | null = null
+  let usedZone = timeZone
+  onStatus?.('Importing the performance report from RingCentral Analytics…')
+  for (let page = 1; ; page++) {
+    const data = await apiGet<PerformancePage>('performance', { ...range, timeZone, page: String(page) }, onStatus)
+    usedZone = data.timeZone || usedZone
+    for (const { date, name, extensionNumber, department, ...r } of data.records) {
+      records.push({
+        ...r,
+        ...analyticsDay(date, usedZone),
+        extensionName: name,
+        extension: extensionNumber,
+        department: departmentFor(deptMap, extensionNumber, department),
+      })
+    }
+    users += data.users
+    unrecognised += data.unrecognised
+    clampedToDays = data.clampedToDays ?? clampedToDays
+    if (!data.hasMore) break
+  }
+  return { records, users, unrecognised, clampedToDays, timeZone: usedZone }
 }

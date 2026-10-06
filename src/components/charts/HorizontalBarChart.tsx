@@ -26,7 +26,7 @@ export function HorizontalBarChart({ data, color = 'var(--series-1)', colors, va
     <ResponsiveContainer width="100%" height={chartHeight}>
       <BarChart data={data} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 0 }} barCategoryGap={10}>
         <CartesianGrid stroke="var(--gridline)" horizontal={false} />
-        <XAxis type="number" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
+        <XAxis type="number" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} tickFormatter={valueFormatter} />
         <YAxis
           type="category"
           dataKey="name"

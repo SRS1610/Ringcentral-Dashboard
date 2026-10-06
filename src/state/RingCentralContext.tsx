@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ApiError, clearPassword, loadPassword, passwordRemembered, setPassword } from '../lib/dashboardApi'
-import { fetchStatus, syncCallLog, syncQos, syncSms, type DataScope, type RcUser, type SyncWindow } from '../lib/ringcentralApi'
+import { fetchStatus, syncCallLog, syncPerformance, syncQos, syncSms, type DataScope, type RcUser, type SyncWindow } from '../lib/ringcentralApi'
+import { isValidTimeZone } from '../lib/timezone'
 import { loadDepartmentMap, saveDepartmentMap, type DepartmentMap } from '../lib/departmentMap'
 import { useData } from './DataContext'
 
@@ -62,6 +63,8 @@ interface RingCentralContextValue {
   smsSkipped: number | null
   /** Anything worth knowing about the last service-quality import. */
   qosNote: string | null
+  /** Anything worth knowing about the last performance-report import. */
+  perfNote: string | null
   /** Set when the previous period couldn't be imported, so period-over-period figures are missing. */
   compareNote: string | null
   departmentMap: DepartmentMap
@@ -69,7 +72,7 @@ interface RingCentralContextValue {
   /** Forgets the dashboard password on this browser. */
   lock: () => void
   retry: () => Promise<void>
-  /** Import calls, SMS and service quality for the last N days, or for an exact calendar from/to window. */
+  /** Import calls, SMS, service quality and the performance report for the last N days, or for an exact calendar from/to window. */
   syncNow: (window: SyncWindow) => Promise<void>
   updateDepartmentMap: (map: DepartmentMap) => void
 }
@@ -80,7 +83,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const isLocked = (e: unknown) => e instanceof ApiError && e.status === 401
 
 export function RingCentralProvider({ children }: { children: ReactNode }) {
-  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, setAccountTimeZone } = useData()
+  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, setPerfFromRingCentral, setAccountTimeZone, timeZone, timeZoneChoice } = useData()
   const [backend, setBackend] = useState<BackendState>('checking')
   const [backendMessage, setBackendMessage] = useState<string | null>(null)
   const [user, setUser] = useState<RcUser | null>(null)
@@ -96,6 +99,14 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
   const [smsSkipped, setSmsSkipped] = useState<number | null>(null)
   const [qosNote, setQosNote] = useState<string | null>(null)
   const [compareNote, setCompareNote] = useState<string | null>(null)
+  const [perfNote, setPerfNote] = useState<string | null>(null)
+  // Refs for the same reason as the department map: a sync always asks for days in the current zone.
+  const zoneRef = useRef(timeZone)
+  const zoneChoiceRef = useRef(timeZoneChoice)
+  useEffect(() => {
+    zoneRef.current = timeZone
+    zoneChoiceRef.current = timeZoneChoice
+  }, [timeZone, timeZoneChoice])
   const [departmentMap, setDepartmentMap] = useState<DepartmentMap>(() => loadDepartmentMap())
   // A ref so syncs started from long-lived callbacks always use the latest mapping.
   const deptRef = useRef(departmentMap)
@@ -128,7 +139,8 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const syncNow = useCallback(
-    async (window: SyncWindow) => {
+    async (window: SyncWindow, zoneOverride?: string) => {
+      const zone = zoneOverride ?? zoneRef.current
       const fmt = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
       const label = typeof window === 'number' ? `RingCentral (last ${window}d)` : `RingCentral (${fmt(window.start)} – ${fmt(window.end)})`
       // Where the requested period starts: comparisons are only shown for periods the import fully covers.
@@ -137,6 +149,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       setLastError(null)
       setQosNote(null)
       setCompareNote(null)
+      setPerfNote(null)
       const errors: string[] = []
       let anySucceeded = false
       let locked: unknown = null
@@ -146,6 +159,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       let calls: Awaited<ReturnType<typeof syncCallLog>> | null = null
       let sms: Awaited<ReturnType<typeof syncSms>> | null = null
       let qosLoaded: Awaited<ReturnType<typeof syncQos>>['records'] = []
+      let perf: Awaited<ReturnType<typeof syncPerformance>> | null = null
       try {
         calls = await syncCallLog(deptRef.current, window, setSyncStatus)
         setCallsFromRingCentral(calls.records, label, coveredFrom)
@@ -173,7 +187,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
           const notes: string[] = []
           // An empty answer leaves any uploaded Analytics export in place rather than blanking the tab.
           if (qos.records.length > 0) setQosFromRingCentral(qos.records, label, coveredFrom)
-          else notes.push('RingCentral Analytics returned no call-queue data for this period.')
+          else notes.push('RingCentral Analytics has no call-queue data for this period, so service level and abandon rate are not shown.')
           qosLoaded = qos.records
           if (qos.skippedNoSla > 0) notes.push(`${qos.skippedNoSla} queue-day(s) had calls but no SLA classification and are left out of Service Quality.`)
           if (qos.clampedToDays) notes.push(`RingCentral Analytics only keeps about ${qos.clampedToDays} days, so earlier dates have no service quality data.`)
@@ -182,6 +196,27 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
         } catch (e) {
           if (isLocked(e)) locked = e
           errors.push(`Service quality: ${message(e)}`)
+        }
+      }
+
+      if (!locked) {
+        try {
+          perf = await syncPerformance(deptRef.current, window, zone, setSyncStatus)
+          setPerfFromRingCentral(perf.records, label, coveredFrom)
+          const notes: string[] = []
+          if (perf.records.length === 0) {
+            notes.push(
+              perf.users === 0 ? 'RingCentral Analytics returned no users for the performance report.' : 'RingCentral Analytics reported no calls for any user in this period.',
+            )
+          }
+          if (perf.unrecognised > 0) notes.push(`${perf.unrecognised} day(s) of the performance report came back in a form the dashboard couldn't read and are left out.`)
+          if (perf.timeZone !== zone) notes.push(`RingCentral Analytics didn't accept the time zone ${zone}, so the performance report counts days in ${perf.timeZone}.`)
+          if (perf.clampedToDays) notes.push(`RingCentral Analytics only keeps about ${perf.clampedToDays} days, so earlier dates are missing from the performance report.`)
+          setPerfNote(notes.length > 0 ? notes.join(' ') : null)
+          anySucceeded = true
+        } catch (e) {
+          if (isLocked(e)) locked = e
+          errors.push(`Performance report: ${message(e)}`)
         }
       }
 
@@ -204,6 +239,10 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
             const earlier = await syncQos(before, comparing)
             setQosFromRingCentral([...qosLoaded, ...earlier.records], label, before.start)
           }
+          if (perf && perf.records.length > 0) {
+            const earlier = await syncPerformance(deptRef.current, before, zone, comparing)
+            setPerfFromRingCentral([...perf.records, ...earlier.records], label, before.start)
+          }
         } catch (e) {
           if (isLocked(e)) locked = e
           else setCompareNote(`The previous period couldn't be imported, so some "vs prior period" figures are missing (${message(e)}).`)
@@ -219,7 +258,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       setSyncStatus(null)
       setSyncing(false)
     },
-    [setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, applyFailure],
+    [setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, setPerfFromRingCentral, applyFailure],
   )
 
   /** Asks the Worker who it is signed in as; on success, imports the default window. */
@@ -233,7 +272,9 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       setBackend('connected')
       setBackendMessage(null)
       setConnecting(false)
-      await syncNow(AUTO_SYNC_DAYS)
+      // The account's zone was only just learned; state hasn't caught up with it yet.
+      const accountZone = isValidTimeZone(status.timeZone) ? status.timeZone : null
+      await syncNow(AUTO_SYNC_DAYS, zoneChoiceRef.current ?? accountZone ?? zoneRef.current)
     } catch (e) {
       applyFailure(e)
       setConnecting(false)
@@ -268,6 +309,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
     setSmsSkipped(null)
     setQosNote(null)
     setCompareNote(null)
+    setPerfNote(null)
     setBackend('locked')
     setBackendMessage(null)
   }, [])
@@ -296,6 +338,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       smsSkipped,
       qosNote,
       compareNote,
+      perfNote,
       departmentMap,
       unlock,
       lock,
@@ -319,6 +362,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       smsSkipped,
       qosNote,
       compareNote,
+      perfNote,
       departmentMap,
       unlock,
       lock,

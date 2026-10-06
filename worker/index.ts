@@ -7,9 +7,10 @@
 //   GET /api/extensions                           user extensions (for the SMS import)
 //   GET /api/sms?from&to&extensionId&page         one page of one user's SMS log
 //   GET /api/qos?from&to&page                     queue service quality per day (Business Analytics API)
+//   GET /api/performance?from&to&page[&timeZone]  each user's calls per day (Business Analytics API)
 
-import { ApiError, RcSession, isForbidden, type Env, type RcRecord } from './ringcentral.ts'
-import { emptyDirectory, mapCall, mapDirectory, mapExtension, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
+import { ApiError, RcSession, RcUpstreamError, isForbidden, type Env, type RcRecord } from './ringcentral.ts'
+import { emptyDirectory, mapCall, mapDirectory, mapExtension, mapPerformanceTimeline, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
 
 const CALL_PAGE_SIZE = '1000'
 const SMS_PAGE_SIZE = '1000'
@@ -270,6 +271,56 @@ async function qos(rc: RcSession, url: URL) {
   return { ...mapped, queues: keys.length, hasMore: page < totalPages, clampedToDays: clamped ? ANALYTICS_MAX_DAYS : null }
 }
 
+/** An IANA-style zone name ("America/Los_Angeles", "US/Pacific", "UTC"); anything else falls back to UTC. */
+function timeZoneParam(url: URL): string {
+  const raw = (url.searchParams.get('timeZone') ?? '').trim()
+  return raw.length <= 64 && /^[A-Za-z0-9_+-]+(\/[A-Za-z0-9_+-]+){0,2}$/.test(raw) ? raw : 'UTC'
+}
+
+// The Analytics Portal's Performance Report, over the API: every user's calls per day, with how
+// they were answered and how long each part of them took. Accounts whose calls go straight to
+// people rather than through queues get their service picture from this, not from /api/qos.
+async function performance(rc: RcSession, url: URL) {
+  const window = windowParams(url)
+  const page = pageParam(url)
+  const timeZone = timeZoneParam(url)
+
+  const earliest = Date.now() - ANALYTICS_MAX_DAYS * DAY_MS
+  const clampedToDays = window.from.getTime() < earliest ? ANALYTICS_MAX_DAYS : null
+  const from = new Date(Math.max(window.from.getTime(), earliest))
+  if (from >= window.to) return { records: [], unrecognised: 0, users: 0, hasMore: false, clampedToDays, timeZone }
+
+  const fetchPage = (zone: string) =>
+    rc.call('/analytics/calls/v1/accounts/~/timeline/fetch', {
+      params: { interval: 'Day', perPage: QOS_PAGE_SIZE, page: String(page) },
+      body: {
+        grouping: { groupBy: 'Users' },
+        timeSettings: { timeZone: zone, timeRange: { timeFrom: from.toISOString(), timeTo: window.to.toISOString() } },
+        responseOptions: {
+          counters: { allCalls: true, callsByDirection: true, callsByResponse: true, callsByResult: true, callsByCompanyHours: true, callsByActions: true },
+          timers: { allCallsDuration: true, callsSegmentsDuration: true },
+        },
+      },
+    })
+
+  let usedZone = timeZone
+  let data: RcRecord
+  try {
+    data = await fetchPage(timeZone)
+  } catch (e) {
+    // A zone name RingCentral doesn't know is a bad request; days in UTC beat no report at all.
+    if (!(e instanceof RcUpstreamError) || e.upstreamStatus !== 400 || timeZone === 'UTC') throw e
+    usedZone = 'UTC'
+    data = await fetchPage('UTC')
+  }
+
+  const users: RcRecord[] = data.data?.records ?? []
+  const directory = users.length > 0 ? await loadDirectory(rc) : emptyDirectory()
+  const mapped = mapPerformanceTimeline(users, directory)
+  const totalPages = Number(data.paging?.totalPages ?? 1)
+  return { ...mapped, users: users.length, hasMore: page < totalPages, clampedToDays, timeZone: usedZone }
+}
+
 async function handleApi(request: Request, env: Env, url: URL): Promise<Response> {
   if (request.method !== 'GET') return json({ error: 'method_not_allowed', message: 'Only GET is supported.' }, 405, { Allow: 'GET' })
   try {
@@ -286,7 +337,9 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
               ? sms
               : route === '/api/qos'
                 ? qos
-                : null
+                : route === '/api/performance'
+                  ? performance
+                  : null
     if (!handler) return json({ error: 'not_found', message: 'Unknown API route.' }, 404)
 
     const rc = await RcSession.open(env, request)

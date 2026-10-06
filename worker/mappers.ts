@@ -264,3 +264,95 @@ export function mapQosTimeline(all: RcRecord[], answered: RcRecord[]): QosMapRes
   }
   return { records, skippedNoSla }
 }
+
+// ---- Business Analytics, per user (the Analytics Portal's Performance Report) -------
+
+/** One user's calls on one day, as RingCentral Analytics counts them. */
+export interface WirePerformance {
+  /** Start of the day, as RingCentral reports it for the requested time zone. */
+  date: string
+  /** Extension id of the user. */
+  key: string
+  name: string
+  extensionNumber: string
+  /** The user's department in the RingCentral directory; "" when none is set there. */
+  department: string
+  calls: number
+  inbound: number
+  outbound: number
+  /** Inbound calls by first response. */
+  answered: number
+  notAnswered: number
+  /** Outbound calls by first response. */
+  connected: number
+  notConnected: number
+  missed: number
+  voicemail: number
+  abandoned: number
+  businessHours: number
+  afterHours: number
+  /** Calls put on hold, and calls transferred (blind, warm or by keypad). */
+  holds: number
+  transfers: number
+  /** Seconds: whole calls, then the ringing, talking and on-hold parts of them. */
+  totalSec: number
+  ringSec: number
+  talkSec: number
+  holdSec: number
+}
+
+export interface PerformanceMapResult {
+  records: WirePerformance[]
+  /** Points RingCentral returned without a call count the dashboard can read. */
+  unrecognised: number
+}
+
+/** Timeline records grouped by Users, one point per day. Days without calls are left out. */
+export function mapPerformanceTimeline(records: RcRecord[], directory: Directory = NO_DIRECTORY): PerformanceMapResult {
+  const out: WirePerformance[] = []
+  let unrecognised = 0
+  for (const record of records) {
+    const key = String(record.key ?? '')
+    const known = directory.extensions.get(key)
+    const name = record.info?.name || known?.name || record.info?.extensionNumber || key
+    for (const point of record.points ?? []) {
+      const c = point.counters
+      if (typeof c?.allCalls?.values !== 'number') {
+        // A day with nothing on it may come back bare; counters without a readable total are worth reporting.
+        if (c && Object.keys(c).length > 0) unrecognised += 1
+        continue
+      }
+      const calls = total(c.allCalls)
+      if (calls <= 0) continue
+      // The request names this counter `callsByActions`; the response has carried it as `callsActions`.
+      const actions = c.callsActions ?? c.callsByActions
+      const segments = point.timers?.callsSegments
+      out.push({
+        date: point.time,
+        key,
+        name,
+        extensionNumber: record.info?.extensionNumber ?? known?.extensionNumber ?? '',
+        department: known?.department ?? '',
+        calls,
+        inbound: part(c.callsByDirection, 'inbound'),
+        outbound: part(c.callsByDirection, 'outbound'),
+        answered: part(c.callsByResponse, 'answered'),
+        notAnswered: part(c.callsByResponse, 'notAnswered'),
+        connected: part(c.callsByResponse, 'connected'),
+        notConnected: part(c.callsByResponse, 'notConnected'),
+        missed: part(c.callsByResult, 'missed'),
+        voicemail: part(c.callsByResult, 'voicemail'),
+        abandoned: part(c.callsByResult, 'abandoned'),
+        businessHours: part(c.callsByCompanyHours, 'businessHours'),
+        afterHours: part(c.callsByCompanyHours, 'afterHours'),
+        holds: part(actions, 'holdOn'),
+        transfers: part(actions, 'blindTransfer') + part(actions, 'warmTransfer') + part(actions, 'dtmfTransfer'),
+        totalSec: Math.round(total(point.timers?.allCalls)),
+        ringSec: Math.round(part(segments, 'ringing')),
+        talkSec: Math.round(part(segments, 'liveTalk')),
+        holdSec: Math.round(part(segments, 'hold', 'holds')),
+      })
+    }
+  }
+  return { records: out, unrecognised }
+}

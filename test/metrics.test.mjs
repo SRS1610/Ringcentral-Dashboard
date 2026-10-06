@@ -12,12 +12,15 @@ import {
   faxKpis,
   filterByRange,
   hasDepartments,
+  performanceByUser,
+  performanceDailyTrend,
+  performanceKpis,
   priorRange,
   smsKpis,
   splitByKind,
   volumeByGroup,
 } from '../src/lib/metrics.ts'
-import { isValidTimeZone, zonedDateKey, zonedDayEnd, zonedDayStart, zonedMidnight, zonedMonthStart, zonedParts } from '../src/lib/timezone.ts'
+import { analyticsDay, isValidTimeZone, zonedDateKey, zonedDayEnd, zonedDayStart, zonedMidnight, zonedMonthStart, zonedParts } from '../src/lib/timezone.ts'
 import { departmentFor } from '../src/lib/departmentMap.ts'
 import { formatDayKey } from '../src/lib/format.ts'
 
@@ -260,4 +263,93 @@ test('with no departments set up, volume is ranked by team member instead of one
     { name: 'Claims', value: 2 },
     { name: 'Unassigned', value: 1 },
   ])
+})
+
+// ---- Performance report (RingCentral Analytics) -------------------------------
+
+const perfRow = (over = {}) => ({
+  date: new Date('2026-09-15T07:00:00Z'),
+  day: '2026-09-15',
+  key: '11',
+  extensionName: 'Pat',
+  extension: '104',
+  department: 'Unassigned',
+  calls: 0,
+  inbound: 0,
+  outbound: 0,
+  answered: 0,
+  notAnswered: 0,
+  connected: 0,
+  notConnected: 0,
+  missed: 0,
+  voicemail: 0,
+  abandoned: 0,
+  businessHours: 0,
+  afterHours: 0,
+  holds: 0,
+  transfers: 0,
+  totalSec: 0,
+  ringSec: 0,
+  talkSec: 0,
+  holdSec: 0,
+  ...over,
+})
+
+test('performance totals: rates and averages come from the summed counts', () => {
+  const rows = [
+    perfRow({ calls: 50, inbound: 10, outbound: 40, answered: 2, notAnswered: 8, connected: 38, notConnected: 2, missed: 5, voicemail: 3, businessHours: 45, afterHours: 5, ringSec: 500, talkSec: 24000, holdSec: 120, holds: 4, transfers: 1 }),
+    perfRow({ day: '2026-09-16', date: new Date('2026-09-16T07:00:00Z'), calls: 30, inbound: 2, outbound: 28, answered: 2, notAnswered: 0, connected: 28, notConnected: 0, businessHours: 30, ringSec: 300, talkSec: 18000 }),
+  ]
+  const k = performanceKpis(rows)
+  assert.deepEqual([k.calls, k.answered, k.notAnswered, k.connected, k.notConnected, k.missed, k.voicemail], [80, 4, 8, 66, 2, 5, 3])
+  assert.equal(Math.round(k.answerRate * 10) / 10, 33.3)
+  assert.equal(Math.round(k.connectRate * 10) / 10, 97.1)
+  assert.equal(k.avgTalkSec, 42000 / 70)
+  assert.equal(k.avgRingSec, 10)
+  assert.equal(k.afterHoursShare, (5 / 80) * 100)
+
+  const empty = performanceKpis([])
+  assert.deepEqual([empty.answerRate, empty.connectRate, empty.avgTalkSec, empty.avgRingSec, empty.afterHoursShare], [0, 0, 0, 0, 0])
+})
+
+test('performance by user rolls days up per person, busiest first', () => {
+  const rows = [
+    perfRow({ calls: 5, answered: 1, notAnswered: 4, talkSec: 300 }),
+    perfRow({ day: '2026-09-16', calls: 7, answered: 3, notAnswered: 0, talkSec: 900 }),
+    perfRow({ key: '12', extensionName: 'Lee', extension: '105', calls: 40, connected: 40, talkSec: 12000 }),
+  ]
+  const users = performanceByUser(rows)
+  assert.deepEqual(users.map((u) => [u.extensionName, u.extension, u.calls, u.answered, u.notAnswered]), [
+    ['Lee', '105', 40, 0, 0],
+    ['Pat', '104', 12, 4, 4],
+  ])
+  assert.equal(users[1].answerRate, 50)
+  assert.equal(users[1].avgTalkSec, 300)
+  assert.equal(users[0].avgTalkSec, 300)
+})
+
+test('the daily answered trend adds users together by day', () => {
+  const rows = [
+    perfRow({ calls: 5, answered: 1, notAnswered: 4 }),
+    perfRow({ key: '12', calls: 3, answered: 2, notAnswered: 1 }),
+    perfRow({ day: '2026-09-14', calls: 2, answered: 2 }),
+  ]
+  assert.deepEqual(performanceDailyTrend(rows), [
+    { date: '2026-09-14', answered: 2, notAnswered: 0, calls: 2 },
+    { date: '2026-09-15', answered: 3, notAnswered: 5, calls: 8 },
+  ])
+})
+
+test('an Analytics day is read the same however RingCentral stamps it', () => {
+  const zone = 'America/Los_Angeles'
+  const midnight = '2026-09-15T07:00:00.000Z'
+  // The true instant of local midnight, as UTC or with an offset.
+  assert.deepEqual(analyticsDay('2026-09-15T07:00:00.000Z', zone), { date: new Date(midnight), day: '2026-09-15' })
+  assert.deepEqual(analyticsDay('2026-09-15T00:00:00.000-07:00', zone), { date: new Date(midnight), day: '2026-09-15' })
+  // The local date stamped 00:00 with a "Z" it doesn't mean, or with no zone at all.
+  assert.deepEqual(analyticsDay('2026-09-15T00:00:00.000Z', zone), { date: new Date(midnight), day: '2026-09-15' })
+  assert.deepEqual(analyticsDay('2026-09-15T00:00:00', zone), { date: new Date(midnight), day: '2026-09-15' })
+  // A first bucket cut short by the requested start keeps its own time.
+  assert.deepEqual(analyticsDay('2026-09-15T16:30:00.000Z', zone), { date: new Date('2026-09-15T16:30:00.000Z'), day: '2026-09-15' })
+  assert.deepEqual(analyticsDay('2026-09-15T00:00:00.000Z', 'UTC'), { date: new Date('2026-09-15T00:00:00.000Z'), day: '2026-09-15' })
 })

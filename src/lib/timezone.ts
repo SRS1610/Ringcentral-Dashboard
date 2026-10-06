@@ -137,6 +137,25 @@ export function zonedMonthStart(date: Date, timeZone: string): Date {
   return zonedMidnight(p.year, p.month, 1, timeZone)
 }
 
+/**
+ * The day a daily bucket from RingCentral Analytics stands for. A bucket starts at midnight in
+ * the zone the report was requested in, but the timestamp can arrive either as that true
+ * instant or as the local date stamped "00:00" with no usable offset. Both are read as the
+ * same day; anything else (a first bucket cut short by the requested start) is taken as given.
+ */
+export function analyticsDay(time: string, timeZone: string): { date: Date; day: string } {
+  const instant = new Date(time)
+  const literal = /^(\d{4})-(\d{2})-(\d{2})T00:00(?::00(?:\.0+)?)?/.exec(time)
+  if (!Number.isNaN(instant.getTime())) {
+    const p = zonedParts(instant, timeZone)
+    if (!literal || (p.hour === 0 && p.minute === 0 && p.second === 0)) return { date: instant, day: zonedDateKey(instant, timeZone) }
+  }
+  if (literal) {
+    return { date: zonedMidnight(Number(literal[1]), Number(literal[2]), Number(literal[3]), timeZone), day: `${literal[1]}-${literal[2]}-${literal[3]}` }
+  }
+  return { date: instant, day: time.slice(0, 10) }
+}
+
 /** Short zone label for captions, e.g. "PDT" or "GMT+8". */
 export function timeZoneAbbreviation(timeZone: string, at: Date = new Date()): string {
   try {

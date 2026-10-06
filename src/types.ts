@@ -47,6 +47,39 @@ export interface SmsRecord {
   status: string
 }
 
+/** One user's calls on one day, as counted by RingCentral Analytics (the portal's Performance Report). */
+export interface PerformanceRecord {
+  /** Start of the day. */
+  date: Date
+  /** `YYYY-MM-DD` of that day in the time zone the report was requested in. */
+  day: string
+  /** Extension id of the user. */
+  key: string
+  extensionName: string
+  extension: string
+  department: string
+  calls: number
+  inbound: number
+  outbound: number
+  /** Inbound calls by first response. */
+  answered: number
+  notAnswered: number
+  /** Outbound calls by first response. */
+  connected: number
+  notConnected: number
+  missed: number
+  voicemail: number
+  abandoned: number
+  businessHours: number
+  afterHours: number
+  holds: number
+  transfers: number
+  totalSec: number
+  ringSec: number
+  talkSec: number
+  holdSec: number
+}
+
 export type DatasetKind = 'calls' | 'qos' | 'sms'
 
 export type DatasetSource = 'site' | 'uploaded' | 'ringcentral'

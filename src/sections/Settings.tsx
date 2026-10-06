@@ -100,6 +100,7 @@ function ConnectedCard() {
           {rc.hasPassword && rc.remembered && <span>The dashboard password is remembered on this browser. "Lock this browser" removes it.</span>}
           {rc.smsSkipped !== null && rc.smsSkipped > 0 && <span>{rc.smsSkipped} user(s) skipped for SMS — likely a permissions/scope issue on that mailbox.</span>}
           {rc.qosNote && <span>{rc.qosNote}</span>}
+          {rc.perfNote && <span>{rc.perfNote}</span>}
           {rc.compareNote && <span>{rc.compareNote}</span>}
         </div>
 

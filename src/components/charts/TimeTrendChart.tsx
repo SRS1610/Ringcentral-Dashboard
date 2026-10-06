@@ -13,9 +13,11 @@ interface TimeTrendChartProps {
   series: Series[]
   valueFormatter: (v: number) => string
   height?: number
+  /** Off for counts, so the axis never shows the same whole number twice. */
+  allowDecimals?: boolean
 }
 
-export function TimeTrendChart({ data, series, valueFormatter, height = 260 }: TimeTrendChartProps) {
+export function TimeTrendChart({ data, series, valueFormatter, height = 260, allowDecimals = true }: TimeTrendChartProps) {
   const tickFormatter = (v: string) => formatDayKey(v)
   const Tip = makeTooltipFormatter(
     tickFormatter,
@@ -39,6 +41,7 @@ export function TimeTrendChart({ data, series, valueFormatter, height = 260 }: T
           axisLine={false}
           tickLine={false}
           width={44}
+          allowDecimals={allowDecimals}
           tickFormatter={(v: number) => valueFormatter(v)}
         />
         <Tooltip content={Tip} cursor={{ stroke: 'var(--baseline)', strokeWidth: 1 }} />
