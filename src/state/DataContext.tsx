@@ -7,6 +7,11 @@ interface DatasetState<T> {
   records: T[]
   source: DatasetSource
   fileName: string
+  /**
+   * The start of the period that was asked for when this data was imported; records can begin
+   * later (a quiet weekend). Null for files, where the first record is all there is to go on.
+   */
+  coveredFrom: Date | null
   loading: boolean
   error: string | null
 }
@@ -18,9 +23,9 @@ interface DataContextValue {
   loadCallsFile: (file: File) => Promise<void>
   loadQosFile: (file: File) => Promise<void>
   loadSmsFile: (file: File) => Promise<void>
-  setCallsFromRingCentral: (records: CallRecord[], label: string) => void
-  setSmsFromRingCentral: (records: SmsRecord[], label: string) => void
-  setQosFromRingCentral: (records: QosRecord[], label: string) => void
+  setCallsFromRingCentral: (records: CallRecord[], label: string, coveredFrom: Date) => void
+  setSmsFromRingCentral: (records: SmsRecord[], label: string, coveredFrom: Date) => void
+  setQosFromRingCentral: (records: QosRecord[], label: string, coveredFrom: Date) => void
   /** Drops uploads and browser imports, going back to the data files published with the site. */
   resetToSiteData: () => Promise<void>
   range: DateRange | null
@@ -53,7 +58,7 @@ function loadTimeZoneChoice(): string | null {
 
 const DataContext = createContext<DataContextValue | null>(null)
 
-const initial = <T,>(): DatasetState<T> => ({ records: [], source: 'site', fileName: '', loading: true, error: null })
+const initial = <T,>(): DatasetState<T> => ({ records: [], source: 'site', fileName: '', coveredFrom: null, loading: true, error: null })
 
 function computeBounds(dates: Date[]): DateRange | null {
   if (dates.length === 0) return null
@@ -123,9 +128,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
         fetch(`${import.meta.env.BASE_URL}data/analytics-qos.csv`).then((r) => r.text()),
         fetch(`${import.meta.env.BASE_URL}data/sms-log.csv`).then((r) => r.text()),
       ])
-      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'site', fileName: 'call-log.csv', loading: false, error: null }))
-      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'site', fileName: 'analytics-qos.csv', loading: false, error: null }))
-      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'site', fileName: 'sms-log.csv', loading: false, error: null }))
+      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'site', fileName: 'call-log.csv', coveredFrom: null, loading: false, error: null }))
+      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'site', fileName: 'analytics-qos.csv', coveredFrom: null, loading: false, error: null }))
+      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'site', fileName: 'sms-log.csv', coveredFrom: null, loading: false, error: null }))
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Failed to load dashboard data'
       const fail = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'site' ? { ...prev, loading: false, error: message } : prev)
@@ -147,7 +152,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const text = await file.text()
       const records = parseCallLogCsv(text)
       if (records.length === 0) throw new Error('No recognizable call records found in this file.')
-      setCalls({ records, source: 'uploaded', fileName: file.name, loading: false, error: null })
+      setCalls({ records, source: 'uploaded', fileName: file.name, coveredFrom: null, loading: false, error: null })
     } catch (e) {
       setCalls((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : 'Failed to parse file' }))
     }
@@ -159,7 +164,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const text = await file.text()
       const records = parseQosCsv(text)
       if (records.length === 0) throw new Error('No recognizable analytics rows found in this file.')
-      setQos({ records, source: 'uploaded', fileName: file.name, loading: false, error: null })
+      setQos({ records, source: 'uploaded', fileName: file.name, coveredFrom: null, loading: false, error: null })
     } catch (e) {
       setQos((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : 'Failed to parse file' }))
     }
@@ -171,22 +176,22 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const text = await file.text()
       const records = parseSmsCsv(text)
       if (records.length === 0) throw new Error('No recognizable SMS records found in this file.')
-      setSms({ records, source: 'uploaded', fileName: file.name, loading: false, error: null })
+      setSms({ records, source: 'uploaded', fileName: file.name, coveredFrom: null, loading: false, error: null })
     } catch (e) {
       setSms((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : 'Failed to parse file' }))
     }
   }, [])
 
-  const setCallsFromRingCentral = useCallback((records: CallRecord[], label: string) => {
-    setCalls({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
+  const setCallsFromRingCentral = useCallback((records: CallRecord[], label: string, coveredFrom: Date) => {
+    setCalls({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
   }, [])
 
-  const setSmsFromRingCentral = useCallback((records: SmsRecord[], label: string) => {
-    setSms({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
+  const setSmsFromRingCentral = useCallback((records: SmsRecord[], label: string, coveredFrom: Date) => {
+    setSms({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
   }, [])
 
-  const setQosFromRingCentral = useCallback((records: QosRecord[], label: string) => {
-    setQos({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
+  const setQosFromRingCentral = useCallback((records: QosRecord[], label: string, coveredFrom: Date) => {
+    setQos({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
   }, [])
 
   const dataBounds = useMemo(() => {

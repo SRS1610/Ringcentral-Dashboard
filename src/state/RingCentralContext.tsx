@@ -131,6 +131,8 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
     async (window: SyncWindow) => {
       const fmt = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
       const label = typeof window === 'number' ? `RingCentral (last ${window}d)` : `RingCentral (${fmt(window.start)} – ${fmt(window.end)})`
+      // Where the requested period starts: comparisons are only shown for periods the import fully covers.
+      const coveredFrom = typeof window === 'number' ? new Date(Date.now() - window * DAY_MS) : window.start
       setSyncing(true)
       setLastError(null)
       setQosNote(null)
@@ -146,7 +148,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       let qosLoaded: Awaited<ReturnType<typeof syncQos>>['records'] = []
       try {
         calls = await syncCallLog(deptRef.current, window, setSyncStatus)
-        setCallsFromRingCentral(calls.records, label)
+        setCallsFromRingCentral(calls.records, label, coveredFrom)
         scopes.push(calls.scope)
         anySucceeded = true
       } catch (e) {
@@ -156,7 +158,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       if (!locked) {
         try {
           sms = await syncSms(deptRef.current, window, setSyncStatus)
-          setSmsFromRingCentral(sms.records, label)
+          setSmsFromRingCentral(sms.records, label, coveredFrom)
           setSmsSkipped(sms.skippedExtensions)
           scopes.push(sms.scope)
           anySucceeded = true
@@ -170,7 +172,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
           const qos = await syncQos(window, setSyncStatus)
           const notes: string[] = []
           // An empty answer leaves any uploaded Analytics export in place rather than blanking the tab.
-          if (qos.records.length > 0) setQosFromRingCentral(qos.records, label)
+          if (qos.records.length > 0) setQosFromRingCentral(qos.records, label, coveredFrom)
           else notes.push('RingCentral Analytics returned no call-queue data for this period.')
           qosLoaded = qos.records
           if (qos.skippedNoSla > 0) notes.push(`${qos.skippedNoSla} queue-day(s) had calls but no SLA classification and are left out of Service Quality.`)
@@ -192,15 +194,15 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
         try {
           if (calls) {
             const earlier = await syncCallLog(deptRef.current, before, comparing)
-            setCallsFromRingCentral(mergeById(calls.records, earlier.records, (c) => c.callId), label)
+            setCallsFromRingCentral(mergeById(calls.records, earlier.records, (c) => c.callId), label, before.start)
           }
           if (sms) {
             const earlier = await syncSms(deptRef.current, before, comparing)
-            setSmsFromRingCentral(mergeById(sms.records, earlier.records, (m) => m.messageId), label)
+            setSmsFromRingCentral(mergeById(sms.records, earlier.records, (m) => m.messageId), label, before.start)
           }
           if (qosLoaded.length > 0) {
             const earlier = await syncQos(before, comparing)
-            setQosFromRingCentral([...qosLoaded, ...earlier.records], label)
+            setQosFromRingCentral([...qosLoaded, ...earlier.records], label, before.start)
           }
         } catch (e) {
           if (isLocked(e)) locked = e

@@ -16,6 +16,22 @@ export function priorRange(range: DateRange): DateRange {
   return { start: new Date(end - lengthMs), end: new Date(end) }
 }
 
+/** How far before a file's first record a comparison period may start: a weekend or holiday with no activity. */
+const FILE_COVERAGE_SLACK_MS = 4 * 86_400_000
+
+/**
+ * Whether the data on hand covers all of `prior`, so a period-over-period figure is like for like.
+ * A period that is only partly loaded would look tiny and turn every change into a huge increase.
+ *
+ * @param coveredFrom  where the imported period starts, when known
+ * @param firstRecord  time of the earliest record, used when it isn't
+ */
+export function coversRange(prior: DateRange, coveredFrom: Date | null, firstRecord: Date | null): boolean {
+  if (coveredFrom) return prior.start.getTime() >= coveredFrom.getTime()
+  if (!firstRecord) return false
+  return prior.start.getTime() >= firstRecord.getTime() - FILE_COVERAGE_SLACK_MS
+}
+
 export function pctDelta(current: number, previous: number): number | null {
   if (previous === 0) return current === 0 ? 0 : null
   return ((current - previous) / previous) * 100

@@ -3,6 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  coversRange,
   callHeatmap,
   callKindOf,
   callKpis,
@@ -216,6 +217,19 @@ test('the prior period is the same length and ends the instant before the range 
   const dayBefore = [call({ startTime: new Date('2026-09-06T18:00:00Z') })]
   assert.equal(filterByRange(dayBefore, (c) => c.startTime, prior).length, 1)
   assert.equal(filterByRange(dayBefore, (c) => c.startTime, range).length, 0)
+})
+
+test('a comparison is made only when the whole prior period is loaded', () => {
+  const prior = { start: new Date('2026-08-08T07:00:00Z'), end: new Date('2026-09-07T06:59:59.999Z') }
+  // Live import: what matters is where the requested period starts, not where records happen to begin.
+  assert.ok(coversRange(prior, new Date('2026-08-07T17:00:00Z'), new Date('2026-08-10T15:00:00Z')), 'covered, though the first record is after a quiet weekend')
+  assert.ok(coversRange(prior, prior.start, null))
+  // Only the last 30 days are loaded: a few hours spill into the prior window, which must not count as a period.
+  assert.ok(!coversRange(prior, new Date('2026-09-06T17:00:00Z'), new Date('2026-09-06T17:30:00Z')))
+  // A file: the first record stands in, with a few days' slack for a quiet start.
+  assert.ok(coversRange(prior, null, new Date('2026-08-10T15:00:00Z')))
+  assert.ok(!coversRange(prior, null, new Date('2026-08-20T15:00:00Z')))
+  assert.ok(!coversRange(prior, null, null))
 })
 
 // ---- Departments -------------------------------------------------------------
