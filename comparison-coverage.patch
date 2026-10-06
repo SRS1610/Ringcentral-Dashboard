@@ -1,0 +1,293 @@
+From c102fd8188425ead6fa843a5e52900bfdb2a3824 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 03:27:21 +1100
+Subject: [PATCH] Compare only against a prior period that is fully loaded
+
+While the previous period was still importing (or when it could not be
+imported), the few hours of data that spill past the start of the selected
+range were treated as the whole prior period, so tiles showed changes like
++145050%. Each dataset now records where its imported period starts, and a
+comparison is made only when that covers the whole prior window; otherwise
+the tile says 'no prior data'.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018BG4qASnEhRd97dGvcBi1i
+---
+ src/lib/metrics.ts               | 16 ++++++++++++++
+ src/state/DataContext.tsx        | 37 ++++++++++++++++++--------------
+ src/state/RingCentralContext.tsx | 14 ++++++------
+ src/state/useFilteredData.ts     | 22 ++++++++++++++-----
+ test/metrics.test.mjs            | 14 ++++++++++++
+ 5 files changed, 76 insertions(+), 27 deletions(-)
+
+diff --git a/src/lib/metrics.ts b/src/lib/metrics.ts
+index a843566..b8492d2 100644
+--- a/src/lib/metrics.ts
++++ b/src/lib/metrics.ts
+@@ -16,6 +16,22 @@ export function priorRange(range: DateRange): DateRange {
+   return { start: new Date(end - lengthMs), end: new Date(end) }
+ }
+ 
++/** How far before a file's first record a comparison period may start: a weekend or holiday with no activity. */
++const FILE_COVERAGE_SLACK_MS = 4 * 86_400_000
++
++/**
++ * Whether the data on hand covers all of `prior`, so a period-over-period figure is like for like.
++ * A period that is only partly loaded would look tiny and turn every change into a huge increase.
++ *
++ * @param coveredFrom  where the imported period starts, when known
++ * @param firstRecord  time of the earliest record, used when it isn't
++ */
++export function coversRange(prior: DateRange, coveredFrom: Date | null, firstRecord: Date | null): boolean {
++  if (coveredFrom) return prior.start.getTime() >= coveredFrom.getTime()
++  if (!firstRecord) return false
++  return prior.start.getTime() >= firstRecord.getTime() - FILE_COVERAGE_SLACK_MS
++}
++
+ export function pctDelta(current: number, previous: number): number | null {
+   if (previous === 0) return current === 0 ? 0 : null
+   return ((current - previous) / previous) * 100
+diff --git a/src/state/DataContext.tsx b/src/state/DataContext.tsx
+index 0eecb47..26cc080 100644
+--- a/src/state/DataContext.tsx
++++ b/src/state/DataContext.tsx
+@@ -7,6 +7,11 @@ interface DatasetState<T> {
+   records: T[]
+   source: DatasetSource
+   fileName: string
++  /**
++   * The start of the period that was asked for when this data was imported; records can begin
++   * later (a quiet weekend). Null for files, where the first record is all there is to go on.
++   */
++  coveredFrom: Date | null
+   loading: boolean
+   error: string | null
+ }
+@@ -18,9 +23,9 @@ interface DataContextValue {
+   loadCallsFile: (file: File) => Promise<void>
+   loadQosFile: (file: File) => Promise<void>
+   loadSmsFile: (file: File) => Promise<void>
+-  setCallsFromRingCentral: (records: CallRecord[], label: string) => void
+-  setSmsFromRingCentral: (records: SmsRecord[], label: string) => void
+-  setQosFromRingCentral: (records: QosRecord[], label: string) => void
++  setCallsFromRingCentral: (records: CallRecord[], label: string, coveredFrom: Date) => void
++  setSmsFromRingCentral: (records: SmsRecord[], label: string, coveredFrom: Date) => void
++  setQosFromRingCentral: (records: QosRecord[], label: string, coveredFrom: Date) => void
+   /** Drops uploads and browser imports, going back to the data files published with the site. */
+   resetToSiteData: () => Promise<void>
+   range: DateRange | null
+@@ -53,7 +58,7 @@ function loadTimeZoneChoice(): string | null {
+ 
+ const DataContext = createContext<DataContextValue | null>(null)
+ 
+-const initial = <T,>(): DatasetState<T> => ({ records: [], source: 'site', fileName: '', loading: true, error: null })
++const initial = <T,>(): DatasetState<T> => ({ records: [], source: 'site', fileName: '', coveredFrom: null, loading: true, error: null })
+ 
+ function computeBounds(dates: Date[]): DateRange | null {
+   if (dates.length === 0) return null
+@@ -123,9 +128,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
+         fetch(`${import.meta.env.BASE_URL}data/analytics-qos.csv`).then((r) => r.text()),
+         fetch(`${import.meta.env.BASE_URL}data/sms-log.csv`).then((r) => r.text()),
+       ])
+-      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'site', fileName: 'call-log.csv', loading: false, error: null }))
+-      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'site', fileName: 'analytics-qos.csv', loading: false, error: null }))
+-      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'site', fileName: 'sms-log.csv', loading: false, error: null }))
++      setCalls(apply<CallRecord>({ records: parseCallLogCsv(callText), source: 'site', fileName: 'call-log.csv', coveredFrom: null, loading: false, error: null }))
++      setQos(apply<QosRecord>({ records: parseQosCsv(qosText), source: 'site', fileName: 'analytics-qos.csv', coveredFrom: null, loading: false, error: null }))
++      setSms(apply<SmsRecord>({ records: parseSmsCsv(smsText), source: 'site', fileName: 'sms-log.csv', coveredFrom: null, loading: false, error: null }))
+     } catch (e) {
+       const message = e instanceof Error ? e.message : 'Failed to load dashboard data'
+       const fail = <T,>(prev: DatasetState<T>) => (replaceExisting || prev.source === 'site' ? { ...prev, loading: false, error: message } : prev)
+@@ -147,7 +152,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
+       const text = await file.text()
+       const records = parseCallLogCsv(text)
+       if (records.length === 0) throw new Error('No recognizable call records found in this file.')
+-      setCalls({ records, source: 'uploaded', fileName: file.name, loading: false, error: null })
++      setCalls({ records, source: 'uploaded', fileName: file.name, coveredFrom: null, loading: false, error: null })
+     } catch (e) {
+       setCalls((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : 'Failed to parse file' }))
+     }
+@@ -159,7 +164,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
+       const text = await file.text()
+       const records = parseQosCsv(text)
+       if (records.length === 0) throw new Error('No recognizable analytics rows found in this file.')
+-      setQos({ records, source: 'uploaded', fileName: file.name, loading: false, error: null })
++      setQos({ records, source: 'uploaded', fileName: file.name, coveredFrom: null, loading: false, error: null })
+     } catch (e) {
+       setQos((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : 'Failed to parse file' }))
+     }
+@@ -171,22 +176,22 @@ export function DataProvider({ children }: { children: ReactNode }) {
+       const text = await file.text()
+       const records = parseSmsCsv(text)
+       if (records.length === 0) throw new Error('No recognizable SMS records found in this file.')
+-      setSms({ records, source: 'uploaded', fileName: file.name, loading: false, error: null })
++      setSms({ records, source: 'uploaded', fileName: file.name, coveredFrom: null, loading: false, error: null })
+     } catch (e) {
+       setSms((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : 'Failed to parse file' }))
+     }
+   }, [])
+ 
+-  const setCallsFromRingCentral = useCallback((records: CallRecord[], label: string) => {
+-    setCalls({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
++  const setCallsFromRingCentral = useCallback((records: CallRecord[], label: string, coveredFrom: Date) => {
++    setCalls({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
+   }, [])
+ 
+-  const setSmsFromRingCentral = useCallback((records: SmsRecord[], label: string) => {
+-    setSms({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
++  const setSmsFromRingCentral = useCallback((records: SmsRecord[], label: string, coveredFrom: Date) => {
++    setSms({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
+   }, [])
+ 
+-  const setQosFromRingCentral = useCallback((records: QosRecord[], label: string) => {
+-    setQos({ records, source: 'ringcentral', fileName: label, loading: false, error: null })
++  const setQosFromRingCentral = useCallback((records: QosRecord[], label: string, coveredFrom: Date) => {
++    setQos({ records, source: 'ringcentral', fileName: label, coveredFrom, loading: false, error: null })
+   }, [])
+ 
+   const dataBounds = useMemo(() => {
+diff --git a/src/state/RingCentralContext.tsx b/src/state/RingCentralContext.tsx
+index bb57d37..d3ee5e9 100644
+--- a/src/state/RingCentralContext.tsx
++++ b/src/state/RingCentralContext.tsx
+@@ -131,6 +131,8 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+     async (window: SyncWindow) => {
+       const fmt = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+       const label = typeof window === 'number' ? `RingCentral (last ${window}d)` : `RingCentral (${fmt(window.start)} – ${fmt(window.end)})`
++      // Where the requested period starts: comparisons are only shown for periods the import fully covers.
++      const coveredFrom = typeof window === 'number' ? new Date(Date.now() - window * DAY_MS) : window.start
+       setSyncing(true)
+       setLastError(null)
+       setQosNote(null)
+@@ -146,7 +148,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       let qosLoaded: Awaited<ReturnType<typeof syncQos>>['records'] = []
+       try {
+         calls = await syncCallLog(deptRef.current, window, setSyncStatus)
+-        setCallsFromRingCentral(calls.records, label)
++        setCallsFromRingCentral(calls.records, label, coveredFrom)
+         scopes.push(calls.scope)
+         anySucceeded = true
+       } catch (e) {
+@@ -156,7 +158,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       if (!locked) {
+         try {
+           sms = await syncSms(deptRef.current, window, setSyncStatus)
+-          setSmsFromRingCentral(sms.records, label)
++          setSmsFromRingCentral(sms.records, label, coveredFrom)
+           setSmsSkipped(sms.skippedExtensions)
+           scopes.push(sms.scope)
+           anySucceeded = true
+@@ -170,7 +172,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+           const qos = await syncQos(window, setSyncStatus)
+           const notes: string[] = []
+           // An empty answer leaves any uploaded Analytics export in place rather than blanking the tab.
+-          if (qos.records.length > 0) setQosFromRingCentral(qos.records, label)
++          if (qos.records.length > 0) setQosFromRingCentral(qos.records, label, coveredFrom)
+           else notes.push('RingCentral Analytics returned no call-queue data for this period.')
+           qosLoaded = qos.records
+           if (qos.skippedNoSla > 0) notes.push(`${qos.skippedNoSla} queue-day(s) had calls but no SLA classification and are left out of Service Quality.`)
+@@ -192,15 +194,15 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+         try {
+           if (calls) {
+             const earlier = await syncCallLog(deptRef.current, before, comparing)
+-            setCallsFromRingCentral(mergeById(calls.records, earlier.records, (c) => c.callId), label)
++            setCallsFromRingCentral(mergeById(calls.records, earlier.records, (c) => c.callId), label, before.start)
+           }
+           if (sms) {
+             const earlier = await syncSms(deptRef.current, before, comparing)
+-            setSmsFromRingCentral(mergeById(sms.records, earlier.records, (m) => m.messageId), label)
++            setSmsFromRingCentral(mergeById(sms.records, earlier.records, (m) => m.messageId), label, before.start)
+           }
+           if (qosLoaded.length > 0) {
+             const earlier = await syncQos(before, comparing)
+-            setQosFromRingCentral([...qosLoaded, ...earlier.records], label)
++            setQosFromRingCentral([...qosLoaded, ...earlier.records], label, before.start)
+           }
+         } catch (e) {
+           if (isLocked(e)) locked = e
+diff --git a/src/state/useFilteredData.ts b/src/state/useFilteredData.ts
+index 4779628..8b75fe8 100644
+--- a/src/state/useFilteredData.ts
++++ b/src/state/useFilteredData.ts
+@@ -1,10 +1,21 @@
+ import { useMemo } from 'react'
+ import { useData } from './DataContext'
+-import { filterByRange, priorRange, splitByKind } from '../lib/metrics'
++import { coversRange, filterByRange, priorRange, splitByKind } from '../lib/metrics'
++
++function earliest<T>(records: T[], getDate: (r: T) => Date): Date | null {
++  let min: number | null = null
++  for (const r of records) {
++    const t = getDate(r).getTime()
++    if (min === null || t < min) min = t
++  }
++  return min === null ? null : new Date(min)
++}
+ 
+ /**
+  * The records inside the selected date range and inside the equal-length window before it.
+  * `calls*` hold phone calls only; faxes from the same RingCentral log are in `fax*`.
++ * A `*Prior` list is empty unless the loaded data covers that whole earlier window, so
++ * comparisons are never made against a partly loaded period.
+  */
+ export function useFilteredData() {
+   const { calls, qos, sms, range, timeZone } = useData()
+@@ -16,7 +27,8 @@ export function useFilteredData() {
+     }
+     const prior = priorRange(range)
+     const current = splitByKind(filterByRange(calls.records, (c) => c.startTime, range))
+-    const before = splitByKind(filterByRange(calls.records, (c) => c.startTime, prior))
++    const callsCovered = coversRange(prior, calls.coveredFrom, earliest(calls.records, (c) => c.startTime))
++    const before = splitByKind(callsCovered ? filterByRange(calls.records, (c) => c.startTime, prior) : [])
+     return {
+       callsInRange: current.voice,
+       faxInRange: current.fax,
+@@ -24,10 +36,10 @@ export function useFilteredData() {
+       smsInRange: filterByRange(sms.records, (s) => s.dateTime, range),
+       callsPrior: before.voice,
+       faxPrior: before.fax,
+-      qosPrior: filterByRange(qos.records, (q) => q.date, prior),
+-      smsPrior: filterByRange(sms.records, (s) => s.dateTime, prior),
++      qosPrior: coversRange(prior, qos.coveredFrom, earliest(qos.records, (q) => q.date)) ? filterByRange(qos.records, (q) => q.date, prior) : [],
++      smsPrior: coversRange(prior, sms.coveredFrom, earliest(sms.records, (s) => s.dateTime)) ? filterByRange(sms.records, (s) => s.dateTime, prior) : [],
+       timeZone,
+       loading,
+     }
+-  }, [calls.records, calls.loading, qos.records, qos.loading, sms.records, sms.loading, range, timeZone])
++  }, [calls.records, calls.coveredFrom, calls.loading, qos.records, qos.coveredFrom, qos.loading, sms.records, sms.coveredFrom, sms.loading, range, timeZone])
+ }
+diff --git a/test/metrics.test.mjs b/test/metrics.test.mjs
+index 8ab56fb..1255692 100644
+--- a/test/metrics.test.mjs
++++ b/test/metrics.test.mjs
+@@ -3,6 +3,7 @@
+ import { test } from 'node:test'
+ import assert from 'node:assert/strict'
+ import {
++  coversRange,
+   callHeatmap,
+   callKindOf,
+   callKpis,
+@@ -218,6 +219,19 @@ test('the prior period is the same length and ends the instant before the range
+   assert.equal(filterByRange(dayBefore, (c) => c.startTime, range).length, 0)
+ })
+ 
++test('a comparison is made only when the whole prior period is loaded', () => {
++  const prior = { start: new Date('2026-08-08T07:00:00Z'), end: new Date('2026-09-07T06:59:59.999Z') }
++  // Live import: what matters is where the requested period starts, not where records happen to begin.
++  assert.ok(coversRange(prior, new Date('2026-08-07T17:00:00Z'), new Date('2026-08-10T15:00:00Z')), 'covered, though the first record is after a quiet weekend')
++  assert.ok(coversRange(prior, prior.start, null))
++  // Only the last 30 days are loaded: a few hours spill into the prior window, which must not count as a period.
++  assert.ok(!coversRange(prior, new Date('2026-09-06T17:00:00Z'), new Date('2026-09-06T17:30:00Z')))
++  // A file: the first record stands in, with a few days' slack for a quiet start.
++  assert.ok(coversRange(prior, null, new Date('2026-08-10T15:00:00Z')))
++  assert.ok(!coversRange(prior, null, new Date('2026-08-20T15:00:00Z')))
++  assert.ok(!coversRange(prior, null, null))
++})
++
+ // ---- Departments -------------------------------------------------------------
+ 
+ test('a department comes from Settings first, then RingCentral’s directory', () => {
+-- 
+2.43.0
+
