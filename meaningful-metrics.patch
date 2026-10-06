@@ -1,0 +1,2695 @@
+From e886794cc8cb77f610438f2271d5a787f13458fc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 02:32:47 +1100
+Subject: [PATCH] Separate fax from calls, add a dashboard time zone, and make
+ comparisons work
+
+Call figures were distorted by three things in RingCentral's data:
+
+- Faxes share the call log. They are now marked by the Worker and kept out of
+  every call metric, with their own tile and Fax activity card.
+- A single answer rate mixed outbound connects with inbound answers and did not
+  count 'Accepted' (an answered inbound call). It is now two rates: inbound
+  answered and outbound connected.
+- Inbound calls nobody picked up carry no extension, so they were all
+  'Unassigned'. They are now matched to the dialled number through the
+  account's phone-number list.
+
+Also:
+
+- Days, hours and displayed times use one time zone: the RingCentral account's
+  by default, or one picked in Settings. The heatmap shows the hours calls
+  actually happen instead of a fixed 8am-6pm UTC window.
+- The period before the selected one is imported in the background so 'vs prior
+  period' has data; the prior window no longer skips a day; tiles say 'no prior
+  data' when there is nothing to compare.
+- Departments come from RingCentral's directory, with the Settings mapping as an
+  override. With none set, charts rank team members instead of one
+  'Unassigned' bar.
+- Service level and abandon rate tiles appear only when queue data exists.
+- SMS delivery rate is measured on messages sent, not on all messages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018BG4qASnEhRd97dGvcBi1i
+---
+ README.md                                   |  16 +-
+ scripts/sync-ringcentral.mjs                |   4 +-
+ src/components/CallerBreakdown.tsx          |  10 +-
+ src/components/DateRangeControl.tsx         |  23 +-
+ src/components/FaxActivityCard.tsx          |  37 +++
+ src/components/GroupVolumeCard.tsx          |  40 ++++
+ src/components/charts/Heatmap.tsx           |  15 +-
+ src/components/charts/ServiceLevelChart.tsx |   4 +-
+ src/components/charts/TimeTrendChart.tsx    |   4 +-
+ src/components/charts/VolumeAreaChart.tsx   |   4 +-
+ src/components/ui/StatTile.tsx              |   2 +-
+ src/lib/departmentMap.ts                    |  10 +-
+ src/lib/format.ts                           |  22 +-
+ src/lib/metrics.ts                          | 172 +++++++++++---
+ src/lib/outcomeColors.ts                    |  11 +
+ src/lib/parsers.ts                          |   6 +-
+ src/lib/ringcentralApi.ts                   |  22 +-
+ src/lib/timezone.ts                         | 150 ++++++++++++
+ src/sections/CallActivity.tsx               |  85 ++++---
+ src/sections/Messaging.tsx                  |  37 +--
+ src/sections/Overview.tsx                   | 166 ++++++-------
+ src/sections/Settings.tsx                   |  44 +++-
+ src/sections/TeamPerformance.tsx            |  33 +--
+ src/state/DataContext.tsx                   |  56 ++++-
+ src/state/RingCentralContext.tsx            |  72 +++++-
+ src/state/useFilteredData.ts                |  32 +--
+ src/types.ts                                |   4 +
+ test/metrics.test.mjs                       | 249 ++++++++++++++++++++
+ test/worker.test.mjs                        | 115 ++++++++-
+ worker/index.ts                             |  43 +++-
+ worker/mappers.ts                           |  75 +++++-
+ 31 files changed, 1290 insertions(+), 273 deletions(-)
+ create mode 100644 src/components/FaxActivityCard.tsx
+ create mode 100644 src/components/GroupVolumeCard.tsx
+ create mode 100644 src/lib/outcomeColors.ts
+ create mode 100644 src/lib/timezone.ts
+ create mode 100644 test/metrics.test.mjs
+
+diff --git a/README.md b/README.md
+index d958ff5..d1aafee 100644
+--- a/README.md
++++ b/README.md
+@@ -69,7 +69,7 @@ a scheduled CI job, so there's nothing extra to host.
+    RingCentral sandbox account instead of production, also add a repository
+    **variable** `RC_SERVER_URL` set to `https://platform.devtest.ringcentral.com`.
+ 4. Edit `scripts/department-map.json` to map your extension numbers to
+-   department names — RingCentral's API doesn't expose department per call, so
++   department names — the scheduled sync doesn't read departments from RingCentral, so
+    this mapping fills that gap. Anything not listed shows as "Unassigned".
+ 5. Run the **Sync RingCentral data** workflow once manually (Actions tab →
+    select it → Run workflow) to do a first pull and confirm it works, then let
+@@ -95,13 +95,13 @@ their browser and is never affected by this sync.
+ 
+ ## Live data: the Cloudflare Worker (recommended)
+ 
+-The dashboard runs on a Cloudflare Worker (`worker/`, config in `wrangler.jsonc`). The Worker serves the built site and a small JSON API under `/api/` that **signs in to RingCentral server-side** with a JWT app credential kept in Worker secrets. Viewers never handle RingCentral credentials: they enter one shared **dashboard password** in the Settings tab, and the last 30 days of calls, SMS and **service quality** import automatically. Picking dates on the calendar fetches exactly that window.
++The dashboard runs on a Cloudflare Worker (`worker/`, config in `wrangler.jsonc`). The Worker serves the built site and a small JSON API under `/api/` that **signs in to RingCentral server-side** with a JWT app credential kept in Worker secrets. Viewers never handle RingCentral credentials: they enter one shared **dashboard password** in the Settings tab, and the last 30 days of calls, SMS and **service quality** import automatically. Picking dates on the calendar fetches exactly that window. After either, the period just before it (same length, up to 92 days) loads in the background so the tiles can show "vs prior period".
+ 
+ What the Worker fetches:
+ 
+ | Tab | RingCentral API | Notes |
+ |---|---|---|
+-| Call Activity, Team Performance, Overview | Call Log API (`/account/~/call-log`) | Company-wide when the JWT's user is an admin; otherwise that user's own calls |
++| Call Activity, Team Performance, Overview | Call Log API (`/account/~/call-log`), plus the extension and phone-number lists | Company-wide when the JWT's user is an admin; otherwise that user's own calls |
+ | Messaging | Message Store API, per user extension | Only numbers, time, direction and status reach the browser — never message text |
+ | Service Quality | **Business Analytics API** (`/analytics/calls/v1/.../timeline/fetch`), grouped by call queue, one point per day | Service level = calls in SLA ÷ (in SLA + out of SLA), per the SLA target set on each queue in RingCentral. Speed of answer and handle time are averaged over answered calls (ring time; talk + hold). Analytics keeps about 184 days. |
+ 
+@@ -122,9 +122,15 @@ Running it locally: `npm run dev:worker` builds the site and starts `wrangler de
+ 
+ How the browser talks to it: every `/api/` request carries the dashboard password. The Worker exchanges the JWT for a RingCentral access token, keeps it in memory, and also hands the browser an encrypted copy (`X-RC-Session` header) that only the Worker's secrets can open, so a recycled Worker doesn't need a new token for every viewer — RingCentral allows only a few token requests per minute. The browser can't read that blob. The access token, the client secret and the JWT never leave the Worker; the API is read-only (GET) and returns only the fields the dashboard shows. `npm test` covers these routes against a fake RingCentral.
+ 
+-**Who a call belongs to.** RingCentral's call log names a call's owner only by extension id, so the Worker looks the id up in the account's extension list (cached for ten minutes) to get the team member's name and extension number. A call to a queue or the main line is credited to the user who answered it, when a call leg shows one. The outside party — the caller on inbound calls, the number dialled on outbound — is never used as the owner; calls nobody on the account owns are listed as "Unassigned". The Team Performance leaderboard shows team members by default (switch to *All lines* for queues, shared lines and unassigned calls) with calls, inbound, outbound, connected, missed, voicemail, answer rate, average duration and talk time per person.
++**Who a call belongs to.** RingCentral's call log names a call's owner only by extension id, so the Worker looks the id up in the account's extension list (cached for ten minutes) to get the team member's name and extension number. A call to a queue or the main line is credited to the user who answered it, when a call leg shows one. An inbound call nobody picked up often carries no extension at all, so it is matched by the number that was dialled against the account's phone-number list: a direct number goes to its owner, a company number shows as a shared line ("Main number +1…"). The outside party — the caller on inbound calls, the number dialled on outbound — is never used as the owner; calls nobody on the account owns are listed as "Unassigned". The Team Performance leaderboard shows team members by default (switch to *All lines* for queues, shared lines and unassigned calls) with calls, inbound, outbound, connected, missed, voicemail, connect rate, average duration and talk time per person.
+ 
+-**Callers behind a metric.** On Call Activity, click a tile (Total, Inbound, Outbound, Answer rate), a bar of the Call outcomes chart, or one of the chips above the *Callers* table to list the outside callers behind that number: caller-ID name, phone number, call count, total time, last call and the team members involved.
++**Calls vs faxes.** RingCentral keeps faxes in the same log as phone calls. The Worker passes on each record's type, and every call figure (totals, rates, trends, the leaderboard, the caller list) counts phone calls only; faxes get their own tile and *Fax activity* card. An uploaded export without a "Type" column is split by result ("Sent", "Received", "Fax Not Sent", …). Two rates replace a single answer rate: **Inbound answered** (inbound calls a person picked up ÷ all inbound calls) and **Outbound connected** (outbound calls that connected ÷ all outbound calls). SMS delivery rate is measured on messages sent.
++
++**Time zone.** Days, hours and displayed call times use one time zone: the one set in RingCentral for the JWT's user, unless a viewer picks another under *Settings → Time zone* (saved on that browser). Without live data it is the browser's own zone. Date presets and calendar picks cover whole days on that clock.
++
++**Departments.** A call's department is the Department field of its owner's extension in RingCentral; *Settings → Department mapping* adds or overrides one by extension number. When no extension has a department, the by-department charts rank team members and lines instead.
++
++**Callers behind a metric.** On Call Activity, click a tile (Total, Inbound, Outbound, Inbound answered, Outbound connected), a bar of the Call outcomes chart, or one of the chips above the *Callers* table to list the outside callers behind that number: caller-ID name, phone number, call count, total time, last call and the team members involved.
+ 
+ Imported data lives in the viewer's browser tab. Uploads (the **Upload data** button) still work and override the live import for that dataset; **Clear uploads and imports** goes back to the site's data files. A static copy of the site (GitHub Pages or Netlify, below) has no `/api/`, so there the Settings tab shows "No dashboard server on this site" and only uploads and the scheduled sync's data files are available.
+ 
+diff --git a/scripts/sync-ringcentral.mjs b/scripts/sync-ringcentral.mjs
+index 249ea7e..9f1ac87 100644
+--- a/scripts/sync-ringcentral.mjs
++++ b/scripts/sync-ringcentral.mjs
+@@ -25,7 +25,7 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 120)
+ 
+ const CALL_HEADERS = [
+   'Call ID', 'Start Time', 'Direction', 'From Name', 'From Number', 'To Name', 'To Number',
+-  'Extension Number', 'Extension Name', 'Department', 'Duration (Seconds)', 'Result', 'Recorded',
++  'Extension Number', 'Extension Name', 'Department', 'Duration (Seconds)', 'Result', 'Recorded', 'Type',
+ ]
+ const SMS_HEADERS = ['Message ID', 'Date/Time', 'Direction', 'From', 'To', 'Extension Name', 'Department', 'Segments', 'Status']
+ 
+@@ -86,6 +86,8 @@ function mapCallRecord(record, deptMap, directory) {
+     'Duration (Seconds)': record.duration ?? 0,
+     Result: record.result ?? 'Unknown',
+     Recorded: record.recording ? 'Yes' : 'No',
++    // "Voice" or "Fax": the dashboard keeps faxes out of call metrics.
++    Type: record.type === 'Fax' ? 'Fax' : 'Voice',
+   }
+ }
+ 
+diff --git a/src/components/CallerBreakdown.tsx b/src/components/CallerBreakdown.tsx
+index 79d1bc4..ce00286 100644
+--- a/src/components/CallerBreakdown.tsx
++++ b/src/components/CallerBreakdown.tsx
+@@ -2,21 +2,21 @@ import { useMemo, useState } from 'react'
+ import type { CallRecord } from '../types'
+ import { ChartCard } from './ui/ChartCard'
+ import { callMetricLabel, callerBreakdown, callsForMetric, type CallMetricKey } from '../lib/metrics'
+-import { formatDuration, formatNumber } from '../lib/format'
++import { formatDateTime, formatDuration, formatNumber } from '../lib/format'
+ 
+ const PRESETS: CallMetricKey[] = ['all', 'inbound', 'outbound', 'connected', 'missed', 'voicemail']
+ const PAGE_SIZE = 25
+ 
+-const formatWhen = (d: Date) => d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+-
+ interface CallerBreakdownProps {
+   calls: CallRecord[]
+   metric: CallMetricKey
+   onMetricChange: (metric: CallMetricKey) => void
++  /** Zone the "Last call" times are shown in. */
++  timeZone: string
+ }
+ 
+ /** Lists the outside parties behind one call metric: who called in, or who was called. */
+-export function CallerBreakdown({ calls, metric, onMetricChange }: CallerBreakdownProps) {
++export function CallerBreakdown({ calls, metric, onMetricChange, timeZone }: CallerBreakdownProps) {
+   const [query, setQuery] = useState('')
+   const [showAll, setShowAll] = useState(false)
+ 
+@@ -108,7 +108,7 @@ export function CallerBreakdown({ calls, metric, onMetricChange }: CallerBreakdo
+                       {formatNumber(c.inbound)} / {formatNumber(c.outbound)}
+                     </td>
+                     <td className="px-2 py-2 text-right tabular-nums whitespace-nowrap">{formatDuration(c.talkSeconds)}</td>
+-                    <td className="px-2 py-2 whitespace-nowrap">{formatWhen(c.lastCall)}</td>
++                    <td className="px-2 py-2 whitespace-nowrap">{formatDateTime(c.lastCall, timeZone)}</td>
+                     <td className="px-2 py-2">
+                       {c.staff.length === 0 ? '—' : c.staff.slice(0, 2).join(', ')}
+                       {c.staff.length > 2 && <span style={{ color: 'var(--text-muted)' }}> +{c.staff.length - 2}</span>}
+diff --git a/src/components/DateRangeControl.tsx b/src/components/DateRangeControl.tsx
+index e091b4a..06e3a8b 100644
+--- a/src/components/DateRangeControl.tsx
++++ b/src/components/DateRangeControl.tsx
+@@ -1,7 +1,8 @@
+ import { useEffect, useRef, useState } from 'react'
+-import { endOfDay, format, startOfDay, subDays } from 'date-fns'
++import { format, startOfDay, subDays } from 'date-fns'
+ import type { DateRangePreset } from '../types'
+ import { formatShortDate } from '../lib/format'
++import { timeZoneAbbreviation, zonedMidnight, zonedParts } from '../lib/timezone'
+ import { useData } from '../state/DataContext'
+ import { useRingCentral } from '../state/RingCentralContext'
+ import { RangeCalendar, type DayRange } from './RangeCalendar'
+@@ -16,8 +17,16 @@ const PRESETS: { key: Exclude<DateRangePreset, 'custom'>; label: string }[] = [
+ 
+ const fmtLong = (d: Date) => format(d, 'd MMM yyyy')
+ 
++// The calendar works on plain local dates; these translate a day shown there to and from
++// the same calendar day in the dashboard's time zone.
++const calendarDay = (instant: Date, timeZone: string): Date => {
++  const p = zonedParts(instant, timeZone)
++  return new Date(p.year, p.month - 1, p.day)
++}
++const dayStartIn = (day: Date, timeZone: string, addDays = 0): Date => zonedMidnight(day.getFullYear(), day.getMonth() + 1, day.getDate() + addDays, timeZone)
++
+ export function DateRangeControl() {
+-  const { preset, setPreset, range, customRange, setCustomRange } = useData()
++  const { preset, setPreset, range, customRange, setCustomRange, timeZone } = useData()
+   const rc = useRingCentral()
+   const [open, setOpen] = useState(false)
+   const [draft, setDraft] = useState<DayRange | null>(null)
+@@ -39,14 +48,15 @@ export function DateRangeControl() {
+   }, [open])
+ 
+   const openPicker = () => {
+-    const seed = customRange ?? range ?? { start: subDays(new Date(), 6), end: new Date() }
+-    setDraft({ start: startOfDay(seed.start), end: startOfDay(seed.end) })
++    const seed = customRange ?? range
++    setDraft(seed ? { start: calendarDay(seed.start, timeZone), end: calendarDay(seed.end, timeZone) } : { start: startOfDay(subDays(new Date(), 6)), end: startOfDay(new Date()) })
+     setOpen((o) => !o)
+   }
+ 
+   const apply = () => {
+     if (!draft) return
+-    const picked = { start: startOfDay(draft.start), end: endOfDay(draft.end) }
++    // Whole days on the dashboard's clock: midnight of the first day to the last millisecond of the last.
++    const picked = { start: dayStartIn(draft.start, timeZone), end: new Date(dayStartIn(draft.end, timeZone, 1).getTime() - 1) }
+     setCustomRange(picked)
+     setOpen(false)
+     // Connected: pull exactly this window's calls, SMS and service quality from RingCentral.
+@@ -140,7 +150,8 @@ export function DateRangeControl() {
+ 
+       {range && (
+         <span className="text-sm tabular-nums" style={{ color: 'var(--text-muted)' }}>
+-          {formatShortDate(range.start)} &ndash; {formatShortDate(range.end)}
++          {formatShortDate(range.start, timeZone)} &ndash; {formatShortDate(range.end, timeZone)}
++          <span title={`Days and hours are counted in ${timeZone}. Change it in Settings.`}> · {timeZoneAbbreviation(timeZone, range.end)}</span>
+           {customActive && rc.syncing && ' · fetching from RingCentral…'}
+         </span>
+       )}
+diff --git a/src/components/FaxActivityCard.tsx b/src/components/FaxActivityCard.tsx
+new file mode 100644
+index 0000000..c1f3d25
+--- /dev/null
++++ b/src/components/FaxActivityCard.tsx
+@@ -0,0 +1,37 @@
++import { useMemo } from 'react'
++import type { CallRecord } from '../types'
++import { ChartCard } from './ui/ChartCard'
++import { HorizontalBarChart } from './charts/HorizontalBarChart'
++import { callOutcomeBreakdown, faxKpis } from '../lib/metrics'
++import { formatNumber } from '../lib/format'
++
++const FAX_COLORS: Record<string, string> = {
++  Sent: 'var(--series-3)',
++  Received: 'var(--series-1)',
++}
++
++/** Faxes sit in RingCentral's call log next to phone calls; they are reported here and nowhere else. */
++export function FaxActivityCard({ fax, className }: { fax: CallRecord[]; className?: string }) {
++  const kpis = useMemo(() => faxKpis(fax), [fax])
++  const outcomes = useMemo(() => callOutcomeBreakdown(fax), [fax])
++  const subtitle =
++    kpis.total === 0
++      ? 'No faxes in this date range'
++      : `${formatNumber(kpis.sent)} sent, ${formatNumber(kpis.received)} received, ${formatNumber(kpis.failed)} failed. Not counted as calls.`
++
++  return (
++    <ChartCard title="Fax activity" subtitle={subtitle} className={className}>
++      {kpis.total === 0 ? (
++        <div className="text-sm py-6 text-center" style={{ color: 'var(--text-muted)' }}>
++          Nothing to show.
++        </div>
++      ) : (
++        <HorizontalBarChart
++          data={outcomes.map((o) => ({ name: o.result, value: o.count }))}
++          colors={outcomes.map((o) => FAX_COLORS[o.result] ?? 'var(--status-critical)')}
++          height={Math.max(140, outcomes.length * 34)}
++        />
++      )}
++    </ChartCard>
++  )
++}
+diff --git a/src/components/GroupVolumeCard.tsx b/src/components/GroupVolumeCard.tsx
+new file mode 100644
+index 0000000..ddfa5e7
+--- /dev/null
++++ b/src/components/GroupVolumeCard.tsx
+@@ -0,0 +1,40 @@
++import { useMemo } from 'react'
++import { ChartCard } from './ui/ChartCard'
++import { HorizontalBarChart } from './charts/HorizontalBarChart'
++import { volumeByGroup } from '../lib/metrics'
++
++interface GroupVolumeCardProps {
++  records: { department: string; extensionName: string }[]
++  /** What is being counted, lower case plural: "calls", "messages". */
++  noun: string
++  /** Show only the busiest N rows. */
++  limit?: number
++  color?: string
++  className?: string
++}
++
++/**
++ * Volume by department when departments are set up (in RingCentral or in Settings).
++ * Without them every record would land in one "Unassigned" bar, so the card ranks
++ * team members and shared lines instead.
++ */
++export function GroupVolumeCard({ records, noun, limit, color = 'var(--series-1)', className }: GroupVolumeCardProps) {
++  const { by, rows } = useMemo(() => volumeByGroup(records), [records])
++  const shown = limit ? rows.slice(0, limit) : rows
++  const Noun = noun.charAt(0).toUpperCase() + noun.slice(1)
++  const ranked = limit && rows.length > limit ? `Top ${limit} of ${rows.length}` : 'All'
++  const title = by === 'department' ? `${Noun} by department` : `${Noun} by team member`
++  const subtitle = by === 'department' ? `${ranked} departments, ranked by ${noun}` : `${ranked} team members and lines, ranked by ${noun}. Add departments in Settings to group them.`
++
++  return (
++    <ChartCard title={title} subtitle={subtitle} className={className}>
++      {shown.length === 0 ? (
++        <div className="text-sm py-6 text-center" style={{ color: 'var(--text-muted)' }}>
++          No {noun} in this date range.
++        </div>
++      ) : (
++        <HorizontalBarChart data={shown} color={color} />
++      )}
++    </ChartCard>
++  )
++}
+diff --git a/src/components/charts/Heatmap.tsx b/src/components/charts/Heatmap.tsx
+index 9f954a6..83e9123 100644
+--- a/src/components/charts/Heatmap.tsx
++++ b/src/components/charts/Heatmap.tsx
+@@ -21,7 +21,15 @@ function hourLabel(h: number): string {
+   return `${hour12}${period}`
+ }
+ 
+-export function Heatmap({ rows, hours, days }: { rows: HeatmapRow[]; hours: number[]; days: string[] }) {
++interface HeatmapProps {
++  rows: HeatmapRow[]
++  hours: number[]
++  days: string[]
++  /** Calls at hours too quiet to earn a column. */
++  outside?: number
++}
++
++export function Heatmap({ rows, hours, days, outside = 0 }: HeatmapProps) {
+   const max = Math.max(1, ...rows.map((r) => r.count))
+   const byKey = new Map(rows.map((r) => [`${r.day}-${r.hour}`, r.count]))
+ 
+@@ -61,6 +69,11 @@ export function Heatmap({ rows, hours, days }: { rows: HeatmapRow[]; hours: numb
+           ))}
+         </div>
+         <span>More calls</span>
++        {outside > 0 && (
++          <span className="ml-2">
++            {outside.toLocaleString()} {outside === 1 ? 'call' : 'calls'} outside these hours not shown
++          </span>
++        )}
+       </div>
+     </div>
+   )
+diff --git a/src/components/charts/ServiceLevelChart.tsx b/src/components/charts/ServiceLevelChart.tsx
+index b0da8f9..d904a2c 100644
+--- a/src/components/charts/ServiceLevelChart.tsx
++++ b/src/components/charts/ServiceLevelChart.tsx
+@@ -1,5 +1,5 @@
+ import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+-import { formatShortDate } from '../../lib/format'
++import { formatDayKey } from '../../lib/format'
+ import { makeTooltipFormatter } from './ChartTooltip'
+ 
+ interface Point {
+@@ -8,7 +8,7 @@ interface Point {
+ }
+ 
+ export function ServiceLevelChart({ data, target = 85, height = 260 }: { data: Point[]; target?: number; height?: number }) {
+-  const tickFormatter = (v: string) => formatShortDate(new Date(v))
++  const tickFormatter = (v: string) => formatDayKey(v)
+   const Tip = makeTooltipFormatter(tickFormatter, [
+     { key: 'serviceLevel', label: 'Service level', color: 'var(--series-3)', format: (v) => `${v.toFixed(0)}%` },
+   ])
+diff --git a/src/components/charts/TimeTrendChart.tsx b/src/components/charts/TimeTrendChart.tsx
+index 44069e2..2dad82b 100644
+--- a/src/components/charts/TimeTrendChart.tsx
++++ b/src/components/charts/TimeTrendChart.tsx
+@@ -1,5 +1,5 @@
+ import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+-import { formatShortDate } from '../../lib/format'
++import { formatDayKey } from '../../lib/format'
+ import { makeTooltipFormatter } from './ChartTooltip'
+ 
+ interface Series {
+@@ -16,7 +16,7 @@ interface TimeTrendChartProps {
+ }
+ 
+ export function TimeTrendChart({ data, series, valueFormatter, height = 260 }: TimeTrendChartProps) {
+-  const tickFormatter = (v: string) => formatShortDate(new Date(v))
++  const tickFormatter = (v: string) => formatDayKey(v)
+   const Tip = makeTooltipFormatter(
+     tickFormatter,
+     series.map((s) => ({ ...s, format: valueFormatter })),
+diff --git a/src/components/charts/VolumeAreaChart.tsx b/src/components/charts/VolumeAreaChart.tsx
+index fa6e7bb..bb0f131 100644
+--- a/src/components/charts/VolumeAreaChart.tsx
++++ b/src/components/charts/VolumeAreaChart.tsx
+@@ -1,5 +1,5 @@
+ import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+-import { formatShortDate } from '../../lib/format'
++import { formatDayKey } from '../../lib/format'
+ import { makeTooltipFormatter } from './ChartTooltip'
+ 
+ interface Point {
+@@ -9,7 +9,7 @@ interface Point {
+ }
+ 
+ export function VolumeAreaChart({ data, height = 260 }: { data: Point[]; height?: number }) {
+-  const tickFormatter = (v: string) => formatShortDate(new Date(v))
++  const tickFormatter = (v: string) => formatDayKey(v)
+   const Tip = makeTooltipFormatter(tickFormatter, [
+     { key: 'inbound', label: 'Inbound', color: 'var(--series-1)', format: (v) => v.toLocaleString() },
+     { key: 'outbound', label: 'Outbound', color: 'var(--series-2)', format: (v) => v.toLocaleString() },
+diff --git a/src/components/ui/StatTile.tsx b/src/components/ui/StatTile.tsx
+index 3d8b9e6..2e6cb8c 100644
+--- a/src/components/ui/StatTile.tsx
++++ b/src/components/ui/StatTile.tsx
+@@ -34,7 +34,7 @@ export function StatTile({ label, value, sublabel, delta, deltaGoodDirection = '
+       <div className="text-2xl sm:text-3xl font-semibold tabular-nums truncate" style={{ color: 'var(--text-primary)' }}>
+         {value}
+       </div>
+-      <div className="flex items-center gap-2 text-sm min-h-[20px]">
++      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm min-h-[20px]">
+         {hasDelta && (isUp || isDown) && (
+           <span
+             className="inline-flex items-center gap-1 font-medium tabular-nums"
+diff --git a/src/lib/departmentMap.ts b/src/lib/departmentMap.ts
+index 31e780f..db969a4 100644
+--- a/src/lib/departmentMap.ts
++++ b/src/lib/departmentMap.ts
+@@ -19,6 +19,12 @@ export function saveDepartmentMap(map: DepartmentMap): void {
+   }
+ }
+ 
+-export function departmentFor(map: DepartmentMap, extensionNumber: string): string {
+-  return map[extensionNumber]?.trim() || 'Unassigned'
++export const UNASSIGNED_DEPARTMENT = 'Unassigned'
++
++/**
++ * The mapping saved in Settings wins; otherwise the department set on the extension in
++ * RingCentral's own directory (`directoryDepartment`) is used.
++ */
++export function departmentFor(map: DepartmentMap, extensionNumber: string, directoryDepartment = ''): string {
++  return map[extensionNumber]?.trim() || directoryDepartment.trim() || UNASSIGNED_DEPARTMENT
+ }
+diff --git a/src/lib/format.ts b/src/lib/format.ts
+index ad19d0a..6231454 100644
+--- a/src/lib/format.ts
++++ b/src/lib/format.ts
+@@ -22,15 +22,33 @@ export function formatDuration(totalSeconds: number): string {
+   return `${m}m ${sec}s`
+ }
+ 
+-export function formatShortDate(d: Date): string {
+-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
++/** "Sep 6" for an instant, as the calendar reads in `timeZone` (the viewer's own zone when omitted). */
++export function formatShortDate(d: Date, timeZone?: string): string {
++  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone })
+ }
+ 
++/** "Sep 6, 9:41 AM" for an instant, on the clock of `timeZone`. */
++export function formatDateTime(d: Date, timeZone?: string): string {
++  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone })
++}
++
++/** `YYYY-MM-DD` of the UTC day; used for data that arrives already bucketed by UTC day. */
+ export function formatDateKey(d: Date): string {
+   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+ }
+ 
++/** "Sep 6" for a `YYYY-MM-DD` day key. The key already names a calendar day, so no zone is applied to it. */
++export function formatDayKey(key: string): string {
++  const d = new Date(`${key}T00:00:00Z`)
++  return Number.isNaN(d.getTime()) ? key : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
++}
++
+ export function formatDelta(pct: number, digits = 0): string {
+   const sign = pct > 0 ? '+' : ''
+   return `${sign}${pct.toFixed(digits)}%`
+ }
++
++/** Caption for a tile's period-over-period figure; says so when nothing earlier is loaded to compare with. */
++export function compareLabel(hasPrior: boolean): string {
++  return hasPrior ? 'vs prior period' : 'no prior data'
++}
+diff --git a/src/lib/metrics.ts b/src/lib/metrics.ts
+index b64e188..a843566 100644
+--- a/src/lib/metrics.ts
++++ b/src/lib/metrics.ts
+@@ -1,5 +1,6 @@
+-import type { CallRecord, DateRange, QosRecord, SmsRecord } from '../types'
+-import { formatDateKey } from './format'
++import type { CallKind, CallRecord, DateRange, QosRecord, SmsRecord } from '../types'
++import { formatDateKey } from './format.ts'
++import { zonedDateKey, zonedParts } from './timezone.ts'
+ 
+ export function filterByRange<T>(records: T[], getDate: (r: T) => Date, range: DateRange): T[] {
+   return records.filter((r) => {
+@@ -8,13 +9,11 @@ export function filterByRange<T>(records: T[], getDate: (r: T) => Date, range: D
+   })
+ }
+ 
+-/** Returns the [start, end] window immediately preceding `range`, same length. */
++/** The window of the same length that ends the instant before `range` starts. */
+ export function priorRange(range: DateRange): DateRange {
+   const lengthMs = range.end.getTime() - range.start.getTime()
+-  return {
+-    start: new Date(range.start.getTime() - lengthMs - 86400000),
+-    end: new Date(range.start.getTime() - 86400000),
+-  }
++  const end = range.start.getTime() - 1
++  return { start: new Date(end - lengthMs), end: new Date(end) }
+ }
+ 
+ export function pctDelta(current: number, previous: number): number | null {
+@@ -22,25 +21,77 @@ export function pctDelta(current: number, previous: number): number | null {
+   return ((current - previous) / previous) * 100
+ }
+ 
++// ---- Voice vs fax ----------------------------------------------------------
++// RingCentral keeps faxes in the same log as phone calls. Live data says which is
++// which; an export without a "Type" column is told apart by its result.
++
++const FAX_RESULTS = new Set(['Received', 'Sent', 'Partial Receive', 'Receive Error', 'Send Error'])
++
++export function isFaxResult(result: string): boolean {
++  return FAX_RESULTS.has(result) || /\bfax\b/i.test(result)
++}
++
++export function callKindOf(type: string | undefined | null, result: string): CallKind {
++  if (type) return /fax/i.test(type) ? 'fax' : 'voice'
++  return isFaxResult(result) ? 'fax' : 'voice'
++}
++
++export function splitByKind(records: CallRecord[]): { voice: CallRecord[]; fax: CallRecord[] } {
++  const voice: CallRecord[] = []
++  const fax: CallRecord[] = []
++  for (const r of records) (r.kind === 'fax' ? fax : voice).push(r)
++  return { voice, fax }
++}
++
++const FAX_OK_RESULTS = new Set(['Received', 'Sent'])
++
++/** Fax counts for a set of fax records. */
++export function faxKpis(fax: CallRecord[]) {
++  const sent = fax.filter((f) => f.direction === 'Outbound').length
++  const failed = fax.filter((f) => !FAX_OK_RESULTS.has(f.result)).length
++  return { total: fax.length, sent, received: fax.length - sent, failed }
++}
++
+ // ---- Calls ---------------------------------------------------------------
++// Every function below expects voice calls only (see `splitByKind`).
+ 
+-const MISSED_RESULTS = new Set(['Missed', 'Rejected', 'Busy'])
++/** RingCentral logs an answered inbound call as "Accepted" and a connected outbound call as "Call connected". */
++const ANSWERED_RESULTS = new Set(['Call connected', 'Accepted'])
++
++export const isAnswered = (c: CallRecord): boolean => ANSWERED_RESULTS.has(c.result)
++
++const rate = (part: number, whole: number): number => (whole > 0 ? (part / whole) * 100 : 0)
+ 
+ export function callKpis(calls: CallRecord[]) {
+   const total = calls.length
+-  const connected = calls.filter((c) => c.result === 'Call connected')
+-  const missed = calls.filter((c) => MISSED_RESULTS.has(c.result))
+-  const answerRate = total > 0 ? (connected.length / total) * 100 : 0
+-  const avgDuration = connected.length > 0 ? connected.reduce((s, c) => s + c.durationSeconds, 0) / connected.length : 0
+-  const inbound = calls.filter((c) => c.direction === 'Inbound').length
++  const answered = calls.filter(isAnswered)
++  const inboundCalls = calls.filter((c) => c.direction === 'Inbound')
++  const inbound = inboundCalls.length
+   const outbound = total - inbound
+-  return { total, connected: connected.length, missed: missed.length, answerRate, avgDuration, inbound, outbound }
++  const inboundAnswered = inboundCalls.filter(isAnswered).length
++  const outboundConnected = answered.length - inboundAnswered
++  const avgDuration = answered.length > 0 ? answered.reduce((s, c) => s + c.durationSeconds, 0) / answered.length : 0
++  return {
++    total,
++    inbound,
++    outbound,
++    connected: answered.length,
++    inboundAnswered,
++    outboundConnected,
++    /** Share of inbound calls a person picked up. */
++    inboundAnswerRate: rate(inboundAnswered, inbound),
++    /** Share of outbound calls that connected. */
++    outboundConnectRate: rate(outboundConnected, outbound),
++    missed: inboundCalls.filter((c) => c.result === 'Missed').length,
++    voicemail: inboundCalls.filter((c) => c.result === 'Voicemail').length,
++    avgDuration,
++  }
+ }
+ 
+-export function dailyCallVolume(calls: CallRecord[]) {
++export function dailyCallVolume(calls: CallRecord[], timeZone: string) {
+   const map = new Map<string, { date: string; inbound: number; outbound: number; total: number }>()
+   for (const c of calls) {
+-    const key = formatDateKey(c.startTime)
++    const key = zonedDateKey(c.startTime, timeZone)
+     const entry = map.get(key) ?? { date: key, inbound: 0, outbound: 0, total: 0 }
+     if (c.direction === 'Inbound') entry.inbound += 1
+     else entry.outbound += 1
+@@ -73,7 +124,7 @@ export function departmentLeaderboard(calls: CallRecord[]): DeptLeaderboardRow[]
+   }
+   return [...map.entries()]
+     .map(([department, records]) => {
+-      const connected = records.filter((r) => r.result === 'Call connected')
++      const connected = records.filter(isAnswered)
+       return {
+         department,
+         total: records.length,
+@@ -85,6 +136,24 @@ export function departmentLeaderboard(calls: CallRecord[]): DeptLeaderboardRow[]
+     .sort((a, b) => b.total - a.total)
+ }
+ 
++const UNASSIGNED = 'Unassigned'
++
++/** True when at least one record carries a real department, so a by-department chart says something. */
++export function hasDepartments(records: { department: string }[]): boolean {
++  return records.some((r) => Boolean(r.department) && r.department !== UNASSIGNED)
++}
++
++/** Record counts per department when departments are set up, otherwise per team member or line. */
++export function volumeByGroup(records: { department: string; extensionName: string }[]): { by: 'department' | 'member'; rows: { name: string; value: number }[] } {
++  const by = hasDepartments(records) ? 'department' : 'member'
++  const map = new Map<string, number>()
++  for (const r of records) {
++    const name = (by === 'department' ? r.department : r.extensionName) || UNASSIGNED
++    map.set(name, (map.get(name) ?? 0) + 1)
++  }
++  return { by, rows: [...map.entries()].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value) }
++}
++
+ export interface AgentLeaderboardRow {
+   extensionName: string
+   extension: string
+@@ -102,8 +171,6 @@ export interface AgentLeaderboardRow {
+   talkSeconds: number
+ }
+ 
+-const UNASSIGNED = 'Unassigned'
+-
+ /** Live data says what kind of extension owns a call; CSV data only has a name, which is taken as a person. */
+ function isStaffCall(c: CallRecord): boolean {
+   if (c.extensionType) return c.extensionType === 'User'
+@@ -120,7 +187,7 @@ export function agentLeaderboard(calls: CallRecord[]): AgentLeaderboardRow[] {
+   }
+   return [...map.entries()]
+     .map(([extensionName, records]) => {
+-      const connected = records.filter((r) => r.result === 'Call connected')
++      const connected = records.filter(isAnswered)
+       const talkSeconds = connected.reduce((s, r) => s + r.durationSeconds, 0)
+       const inbound = records.filter((r) => r.direction === 'Inbound').length
+       return {
+@@ -147,7 +214,7 @@ export function agentLeaderboard(calls: CallRecord[]): AgentLeaderboardRow[] {
+ /** A headline metric, or `result:<name>` for one bar of the call outcomes chart. */
+ export type CallMetricKey = 'all' | 'inbound' | 'outbound' | 'connected' | 'missed' | 'voicemail' | `result:${string}`
+ 
+-const RESULT_PRESETS: Record<string, CallMetricKey> = { 'Call connected': 'connected', Missed: 'missed', Voicemail: 'voicemail' }
++const RESULT_PRESETS: Record<string, CallMetricKey> = { Missed: 'missed', Voicemail: 'voicemail' }
+ 
+ /** The metric for one call result, as shown in the call outcomes chart. */
+ export const metricForResult = (result: string): CallMetricKey => RESULT_PRESETS[result] ?? `result:${result}`
+@@ -187,7 +254,7 @@ export function callsForMetric(calls: CallRecord[], key: CallMetricKey): CallRec
+     case 'outbound':
+       return calls.filter((c) => c.direction === 'Outbound')
+     case 'connected':
+-      return calls.filter((c) => c.result === 'Call connected')
++      return calls.filter(isAnswered)
+     case 'missed':
+       return calls.filter((c) => c.result === 'Missed')
+     case 'voicemail':
+@@ -242,24 +309,47 @@ export function callerBreakdown(calls: CallRecord[]): CallerRow[] {
+     .sort((a, b) => b.total - a.total || b.lastCall.getTime() - a.lastCall.getTime())
+ }
+ 
+-const HOUR_BUCKETS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+ const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+-
+-export function callHeatmap(calls: CallRecord[]) {
++/** Always shown, so a quiet week still draws a readable grid. */
++const CORE_HOURS = { first: 9, last: 17 }
++/** An hour needs this share of all calls to widen the grid; strays are counted in `outside` instead. */
++const MIN_HOUR_SHARE = 0.01
++
++/**
++ * Call counts by weekday and hour on the clock of `timeZone`. The hours shown stretch to
++ * cover when calls actually happen rather than assuming a fixed working day.
++ */
++export function callHeatmap(calls: CallRecord[], timeZone: string) {
+   const grid = new Map<string, number>()
++  const perHour = new Array<number>(24).fill(0)
+   for (const c of calls) {
+-    const day = c.startTime.getUTCDay()
+-    const hour = c.startTime.getUTCHours()
+-    const key = `${day}-${hour}`
++    const { weekday, hour } = zonedParts(c.startTime, timeZone)
++    const key = `${weekday}-${hour}`
+     grid.set(key, (grid.get(key) ?? 0) + 1)
++    perHour[hour] += 1
++  }
++
++  let first = CORE_HOURS.first
++  let last = CORE_HOURS.last
++  const threshold = Math.max(1, calls.length * MIN_HOUR_SHARE)
++  for (let hour = 0; hour < 24; hour++) {
++    if (perHour[hour] < threshold) continue
++    if (hour < first) first = hour
++    if (hour > last) last = hour
+   }
++  const hours: number[] = []
++  for (let hour = first; hour <= last; hour++) hours.push(hour)
++
+   const rows: { day: string; hour: number; count: number }[] = []
++  let shown = 0
+   for (let day = 0; day < 7; day++) {
+-    for (const hour of HOUR_BUCKETS) {
+-      rows.push({ day: DAY_LABELS[day], hour, count: grid.get(`${day}-${hour}`) ?? 0 })
++    for (const hour of hours) {
++      const count = grid.get(`${day}-${hour}`) ?? 0
++      shown += count
++      rows.push({ day: DAY_LABELS[day], hour, count })
+     }
+   }
+-  return { rows, hours: HOUR_BUCKETS, days: DAY_LABELS }
++  return { rows, hours, days: DAY_LABELS, outside: calls.length - shown }
+ }
+ 
+ // ---- QoS / Service quality -------------------------------------------------
+@@ -319,19 +409,25 @@ export function qosByQueue(qos: QosRecord[]) {
+ 
+ // ---- SMS -------------------------------------------------------------------
+ 
++/** RingCentral's outbound statuses that mean the message did not get through. */
++const SMS_FAILED_STATUSES = new Set(['DeliveryFailed', 'SendingFailed'])
++
+ export function smsKpis(sms: SmsRecord[]) {
+   const total = sms.length
+-  const delivered = sms.filter((s) => s.status === 'Delivered').length
+-  const inbound = sms.filter((s) => s.direction === 'Inbound').length
+-  const outbound = total - inbound
+-  const deliveryRate = total > 0 ? (delivered / total) * 100 : 0
+-  return { total, delivered, inbound, outbound, deliveryRate }
++  const outboundMessages = sms.filter((s) => s.direction === 'Outbound')
++  const outbound = outboundMessages.length
++  const inbound = total - outbound
++  const delivered = outboundMessages.filter((s) => s.status === 'Delivered').length
++  const failed = outboundMessages.filter((s) => SMS_FAILED_STATUSES.has(s.status)).length
++  // Only messages the team sent can be delivered or not; received messages are left out of the rate.
++  const deliveryRate = rate(delivered, outbound)
++  return { total, delivered, failed, inbound, outbound, deliveryRate }
+ }
+ 
+-export function smsDailyVolume(sms: SmsRecord[]) {
++export function smsDailyVolume(sms: SmsRecord[], timeZone: string) {
+   const map = new Map<string, { date: string; inbound: number; outbound: number; total: number }>()
+   for (const s of sms) {
+-    const key = formatDateKey(s.dateTime)
++    const key = zonedDateKey(s.dateTime, timeZone)
+     const entry = map.get(key) ?? { date: key, inbound: 0, outbound: 0, total: 0 }
+     if (s.direction === 'Inbound') entry.inbound += 1
+     else entry.outbound += 1
+diff --git a/src/lib/outcomeColors.ts b/src/lib/outcomeColors.ts
+new file mode 100644
+index 0000000..24c2b55
+--- /dev/null
++++ b/src/lib/outcomeColors.ts
+@@ -0,0 +1,11 @@
++/** Bar colours for call results; anything not listed gets the neutral series colour. */
++export const OUTCOME_COLORS: Record<string, string> = {
++  'Call connected': 'var(--status-good)',
++  Accepted: 'var(--status-good)',
++  Missed: 'var(--status-critical)',
++  Voicemail: 'var(--series-1)',
++  Rejected: 'var(--status-serious)',
++  Busy: 'var(--status-warning)',
++}
++
++export const outcomeColor = (result: string): string => OUTCOME_COLORS[result] ?? 'var(--series-7)'
+diff --git a/src/lib/parsers.ts b/src/lib/parsers.ts
+index 382714e..5aa59cd 100644
+--- a/src/lib/parsers.ts
++++ b/src/lib/parsers.ts
+@@ -1,5 +1,6 @@
+ import type { CallRecord, QosRecord, SmsRecord } from '../types'
+ import { parseCsvText, resolveColumn, toDate, toNumber } from './csv'
++import { callKindOf } from './metrics'
+ 
+ /**
+  * Column resolution is tolerant of real-world RingCentral export naming
+@@ -23,6 +24,7 @@ export function parseCallLogCsv(text: string): CallRecord[] {
+     department: resolveColumn(headers, ['Department', 'Queue', 'Team']),
+     duration: resolveColumn(headers, ['Duration (Seconds)', 'Duration', 'Call Duration', 'Length (Seconds)']),
+     result: resolveColumn(headers, ['Result', 'Action Result', 'Call Result', 'Status']),
++    type: resolveColumn(headers, ['Type', 'Call Type']),
+     recorded: resolveColumn(headers, ['Recorded', 'Recording']),
+   }
+ 
+@@ -31,8 +33,10 @@ export function parseCallLogCsv(text: string): CallRecord[] {
+     const start = toDate(col.start ? row[col.start] : undefined)
+     if (!start) continue
+     const direction = (col.direction ? row[col.direction] : '') as CallRecord['direction']
++    const result = (col.result ? row[col.result] : '') || 'Unknown'
+     records.push({
+       callId: (col.id ? row[col.id] : undefined) ?? `${start.getTime()}-${records.length}`,
++      kind: callKindOf(col.type ? row[col.type] : undefined, result),
+       startTime: start,
+       direction: direction === 'Outbound' ? 'Outbound' : 'Inbound',
+       fromName: (col.fromName ? row[col.fromName] : '') ?? '',
+@@ -43,7 +47,7 @@ export function parseCallLogCsv(text: string): CallRecord[] {
+       extensionName: (col.extensionName ? row[col.extensionName] : '') ?? 'Unassigned',
+       department: (col.department ? row[col.department] : '') || 'Unassigned',
+       durationSeconds: toNumber(col.duration ? row[col.duration] : undefined),
+-      result: (col.result ? row[col.result] : '') || 'Unknown',
++      result,
+       recorded: /^y/i.test((col.recorded ? row[col.recorded] : '') ?? ''),
+     })
+   }
+diff --git a/src/lib/ringcentralApi.ts b/src/lib/ringcentralApi.ts
+index 8b35cfb..d4f8432 100644
+--- a/src/lib/ringcentralApi.ts
++++ b/src/lib/ringcentralApi.ts
+@@ -2,6 +2,7 @@ import type { CallRecord, QosRecord, SmsRecord } from '../types'
+ import type { DepartmentMap } from './departmentMap'
+ import { departmentFor } from './departmentMap'
+ import { ApiError, apiGet, type StatusCallback } from './dashboardApi'
++import { callKindOf } from './metrics'
+ 
+ export type { StatusCallback } from './dashboardApi'
+ 
+@@ -17,6 +18,8 @@ export interface RcUser {
+ export interface RcStatus {
+   user: RcUser
+   environment: 'production' | 'sandbox'
++  /** The time zone set in RingCentral for the signed-in user; "" when RingCentral didn't say. */
++  timeZone?: string
+ }
+ 
+ /** Either "the last N days" or an exact from/to window picked on the calendar. */
+@@ -37,7 +40,12 @@ export function fetchStatus(): Promise<RcStatus> {
+ 
+ // ---- Calls ----------------------------------------------------------------------
+ 
+-type WireCall = Omit<CallRecord, 'startTime' | 'department'> & { startTime: string }
++type WireCall = Omit<CallRecord, 'startTime' | 'department' | 'kind'> & {
++  startTime: string
++  /** "Voice" or "Fax"; absent from a Worker deployed before faxes were told apart. */
++  type?: string
++  extensionDepartment?: string
++}
+ 
+ interface CallPage {
+   records: WireCall[]
+@@ -60,8 +68,13 @@ export async function syncCallLog(deptMap: DepartmentMap, window: SyncWindow, on
+     if (scope === 'self') params.scope = 'self'
+     const data = await apiGet<CallPage>('calls', params, onStatus)
+     scope = data.scope
+-    for (const r of data.records) {
+-      records.push({ ...r, startTime: new Date(r.startTime), department: departmentFor(deptMap, r.extension) })
++    for (const { type, extensionDepartment, ...r } of data.records) {
++      records.push({
++        ...r,
++        kind: callKindOf(type, r.result),
++        startTime: new Date(r.startTime),
++        department: departmentFor(deptMap, r.extension, extensionDepartment),
++      })
+     }
+     if (!data.hasMore) break
+     onStatus?.(`Importing call log (${records.length.toLocaleString()} calls so far)…`)
+@@ -75,6 +88,7 @@ interface WireExtension {
+   id: string
+   name: string
+   extensionNumber: string
++  department?: string
+ }
+ 
+ type WireSms = Omit<SmsRecord, 'dateTime' | 'extensionName' | 'department' | 'segments'> & { dateTime: string }
+@@ -101,7 +115,7 @@ export async function syncSms(deptMap: DepartmentMap, window: SyncWindow, onStat
+             ...m,
+             dateTime: new Date(m.dateTime),
+             extensionName: ext.name,
+-            department: departmentFor(deptMap, ext.extensionNumber),
++            department: departmentFor(deptMap, ext.extensionNumber, ext.department),
+             segments: 1,
+           })
+         }
+diff --git a/src/lib/timezone.ts b/src/lib/timezone.ts
+new file mode 100644
+index 0000000..d8a89ee
+--- /dev/null
++++ b/src/lib/timezone.ts
+@@ -0,0 +1,150 @@
++// The dashboard reports in one time zone (the RingCentral account's, unless the viewer
++// picks another in Settings), so "Tuesday 9am" means the team's Tuesday 9am no matter
++// where the page is opened. Everything here works on plain Dates and an IANA zone name.
++
++const DAY_MS = 86_400_000
++
++export function isValidTimeZone(timeZone: string | null | undefined): timeZone is string {
++  if (!timeZone) return false
++  try {
++    new Intl.DateTimeFormat('en-US', { timeZone })
++    return true
++  } catch {
++    return false
++  }
++}
++
++export function browserTimeZone(): string {
++  try {
++    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
++  } catch {
++    return 'UTC'
++  }
++}
++
++export function listTimeZones(): string[] {
++  try {
++    return Intl.supportedValuesOf('timeZone')
++  } catch {
++    return ['UTC']
++  }
++}
++
++export interface ZonedParts {
++  year: number
++  /** 1–12 */
++  month: number
++  day: number
++  /** 0–23 */
++  hour: number
++  minute: number
++  second: number
++  /** 0 = Sunday */
++  weekday: number
++}
++
++const WEEKDAYS: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }
++const partsFormatters = new Map<string, Intl.DateTimeFormat>()
++
++function partsFormatter(timeZone: string): Intl.DateTimeFormat {
++  let fmt = partsFormatters.get(timeZone)
++  if (!fmt) {
++    fmt = new Intl.DateTimeFormat('en-US', {
++      timeZone,
++      hourCycle: 'h23',
++      weekday: 'short',
++      year: 'numeric',
++      month: '2-digit',
++      day: '2-digit',
++      hour: '2-digit',
++      minute: '2-digit',
++      second: '2-digit',
++    })
++    partsFormatters.set(timeZone, fmt)
++  }
++  return fmt
++}
++
++/** The calendar date and clock time `date` falls on in `timeZone`. */
++export function zonedParts(date: Date, timeZone: string): ZonedParts {
++  const out: ZonedParts = { year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0, weekday: 0 }
++  for (const part of partsFormatter(timeZone).formatToParts(date)) {
++    switch (part.type) {
++      case 'year':
++        out.year = Number(part.value)
++        break
++      case 'month':
++        out.month = Number(part.value)
++        break
++      case 'day':
++        out.day = Number(part.value)
++        break
++      case 'hour':
++        out.hour = Number(part.value) % 24
++        break
++      case 'minute':
++        out.minute = Number(part.value)
++        break
++      case 'second':
++        out.second = Number(part.value)
++        break
++      case 'weekday':
++        out.weekday = WEEKDAYS[part.value] ?? 0
++        break
++    }
++  }
++  return out
++}
++
++const pad = (n: number) => String(n).padStart(2, '0')
++
++/** `YYYY-MM-DD` of the day `date` falls on in `timeZone`. */
++export function zonedDateKey(date: Date, timeZone: string): string {
++  const p = zonedParts(date, timeZone)
++  return `${p.year}-${pad(p.month)}-${pad(p.day)}`
++}
++
++/** How far `timeZone`'s clock is ahead of UTC at `date`, in ms. */
++function offsetMs(date: Date, timeZone: string): number {
++  const p = zonedParts(date, timeZone)
++  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
++  return asUtc - Math.floor(date.getTime() / 1000) * 1000
++}
++
++/** The instant a calendar day starts in `timeZone`. `month` is 1–12; `day` may overflow (day 32 rolls into the next month). */
++export function zonedMidnight(year: number, month: number, day: number, timeZone: string): Date {
++  const wallClock = Date.UTC(year, month - 1, day)
++  // The offset at the answer can differ from the offset at the first guess across a DST change; a second pass settles it.
++  let instant = wallClock - offsetMs(new Date(wallClock), timeZone)
++  instant = wallClock - offsetMs(new Date(instant), timeZone)
++  return new Date(instant)
++}
++
++/** Start of the day `date` falls on in `timeZone`, moved by `addDays` calendar days. */
++export function zonedDayStart(date: Date, timeZone: string, addDays = 0): Date {
++  const p = zonedParts(date, timeZone)
++  return zonedMidnight(p.year, p.month, p.day + addDays, timeZone)
++}
++
++/** Last millisecond of the day `date` falls on in `timeZone`. */
++export function zonedDayEnd(date: Date, timeZone: string): Date {
++  return new Date(zonedDayStart(date, timeZone, 1).getTime() - 1)
++}
++
++/** Start of the month `date` falls in, in `timeZone`. */
++export function zonedMonthStart(date: Date, timeZone: string): Date {
++  const p = zonedParts(date, timeZone)
++  return zonedMidnight(p.year, p.month, 1, timeZone)
++}
++
++/** Short zone label for captions, e.g. "PDT" or "GMT+8". */
++export function timeZoneAbbreviation(timeZone: string, at: Date = new Date()): string {
++  try {
++    const part = new Intl.DateTimeFormat('en-US', { timeZone, timeZoneName: 'short' }).formatToParts(at).find((p) => p.type === 'timeZoneName')
++    return part?.value ?? timeZone
++  } catch {
++    return timeZone
++  }
++}
++
++export { DAY_MS }
+diff --git a/src/sections/CallActivity.tsx b/src/sections/CallActivity.tsx
+index 7d6701e..0963040 100644
+--- a/src/sections/CallActivity.tsx
++++ b/src/sections/CallActivity.tsx
+@@ -1,4 +1,5 @@
+ import { useMemo, useRef, useState } from 'react'
++import { useData } from '../state/DataContext'
+ import { useFilteredData } from '../state/useFilteredData'
+ import { StatTile } from '../components/ui/StatTile'
+ import { ChartCard } from '../components/ui/ChartCard'
+@@ -6,19 +7,16 @@ import { VolumeAreaChart } from '../components/charts/VolumeAreaChart'
+ import { HorizontalBarChart } from '../components/charts/HorizontalBarChart'
+ import { Heatmap } from '../components/charts/Heatmap'
+ import { CallerBreakdown } from '../components/CallerBreakdown'
+-import { callHeatmap, callKpis, callOutcomeBreakdown, dailyCallVolume, departmentLeaderboard, metricForResult, pctDelta, resultForMetric, type CallMetricKey } from '../lib/metrics'
+-import { formatDuration, formatNumber, formatPercent } from '../lib/format'
+-
+-const OUTCOME_COLORS: Record<string, string> = {
+-  'Call connected': 'var(--status-good)',
+-  Missed: 'var(--status-critical)',
+-  Voicemail: 'var(--series-1)',
+-  Rejected: 'var(--status-serious)',
+-  Busy: 'var(--status-warning)',
+-}
++import { FaxActivityCard } from '../components/FaxActivityCard'
++import { GroupVolumeCard } from '../components/GroupVolumeCard'
++import { callHeatmap, callKpis, callOutcomeBreakdown, dailyCallVolume, metricForResult, pctDelta, resultForMetric, type CallMetricKey } from '../lib/metrics'
++import { compareLabel, formatDuration, formatNumber, formatPercent } from '../lib/format'
++import { outcomeColor } from '../lib/outcomeColors'
++import { timeZoneAbbreviation } from '../lib/timezone'
+ 
+ export function CallActivity() {
+-  const { callsInRange, callsPrior, loading } = useFilteredData()
++  const { calls } = useData()
++  const { callsInRange, callsPrior, faxInRange, timeZone, loading } = useFilteredData()
+   const [metric, setMetric] = useState<CallMetricKey>('missed')
+   const callersRef = useRef<HTMLDivElement>(null)
+ 
+@@ -33,42 +31,50 @@ export function CallActivity() {
+     const cur = callKpis(callsInRange)
+     const prior = callKpis(callsPrior)
+     return {
+-      total: cur.total,
++      ...cur,
+       totalDelta: pctDelta(cur.total, prior.total),
+-      inbound: cur.inbound,
+       inboundDelta: pctDelta(cur.inbound, prior.inbound),
+-      outbound: cur.outbound,
+       outboundDelta: pctDelta(cur.outbound, prior.outbound),
+-      avgDuration: cur.avgDuration,
++      inboundAnswerDelta: prior.inbound > 0 ? pctDelta(cur.inboundAnswerRate, prior.inboundAnswerRate) : null,
++      outboundConnectDelta: prior.outbound > 0 ? pctDelta(cur.outboundConnectRate, prior.outboundConnectRate) : null,
+       avgDurationDelta: pctDelta(cur.avgDuration, prior.avgDuration),
+-      answerRate: cur.answerRate,
+-      answerRateDelta: pctDelta(cur.answerRate, prior.answerRate),
+     }
+   }, [callsInRange, callsPrior])
+ 
+-  const volume = useMemo(() => dailyCallVolume(callsInRange), [callsInRange])
+-  const heatmap = useMemo(() => callHeatmap(callsInRange), [callsInRange])
++  const volume = useMemo(() => dailyCallVolume(callsInRange, timeZone), [callsInRange, timeZone])
++  const heatmap = useMemo(() => callHeatmap(callsInRange, timeZone), [callsInRange, timeZone])
+   const outcomes = useMemo(() => callOutcomeBreakdown(callsInRange), [callsInRange])
+-  const departments = useMemo(() => departmentLeaderboard(callsInRange), [callsInRange])
+ 
+   if (loading) {
+     return <div className="text-sm py-12 text-center" style={{ color: 'var(--text-muted)' }}>Loading call activity&hellip;</div>
+   }
+ 
++  const compare = compareLabel(callsPrior.length > 0)
++  const hasFax = calls.records.some((r) => r.kind === 'fax')
++  const zone = timeZoneAbbreviation(timeZone, callsInRange[0]?.startTime)
++
+   return (
+     <div className="flex flex-col gap-5">
+-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+-        <StatTile label="Total calls" value={formatNumber(kpis.total)} delta={kpis.totalDelta} sublabel="vs prior period" {...tile('all')} />
+-        <StatTile label="Inbound" value={formatNumber(kpis.inbound)} delta={kpis.inboundDelta} sublabel="vs prior period" {...tile('inbound')} />
+-        <StatTile label="Outbound" value={formatNumber(kpis.outbound)} delta={kpis.outboundDelta} sublabel="vs prior period" {...tile('outbound')} />
+-        <StatTile label="Answer rate" value={formatPercent(kpis.answerRate)} delta={kpis.answerRateDelta} sublabel="vs prior period" {...tile('connected')} />
++      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
++        <StatTile label="Total calls" value={formatNumber(kpis.total)} delta={kpis.totalDelta} sublabel={compare} {...tile('all')} />
++        <StatTile label="Inbound" value={formatNumber(kpis.inbound)} delta={kpis.inboundDelta} sublabel={compare} {...tile('inbound')} />
++        <StatTile label="Outbound" value={formatNumber(kpis.outbound)} delta={kpis.outboundDelta} sublabel={compare} {...tile('outbound')} />
++        <StatTile
++          label="Inbound answered"
++          value={kpis.inbound > 0 ? formatPercent(kpis.inboundAnswerRate) : '—'}
++          delta={kpis.inboundAnswerDelta}
++          sublabel={kpis.inbound > 0 ? `${formatNumber(kpis.inboundAnswered)} of ${formatNumber(kpis.inbound)} inbound` : 'No inbound calls'}
++          onClick={() => showCallers('missed')}
++          actionLabel="Show the callers who were missed"
++        />
+         <StatTile
+-          label="Avg duration"
+-          value={formatDuration(kpis.avgDuration)}
+-          delta={kpis.avgDurationDelta}
+-          deltaGoodDirection="down"
+-          sublabel="vs prior period"
++          label="Outbound connected"
++          value={kpis.outbound > 0 ? formatPercent(kpis.outboundConnectRate) : '—'}
++          delta={kpis.outboundConnectDelta}
++          sublabel={kpis.outbound > 0 ? `${formatNumber(kpis.outboundConnected)} of ${formatNumber(kpis.outbound)} outbound` : 'No outbound calls'}
++          {...tile('connected')}
+         />
++        <StatTile label="Avg duration" value={formatDuration(kpis.avgDuration)} delta={kpis.avgDurationDelta} deltaGoodDirection="down" sublabel={compare} />
+       </div>
+ 
+       <ChartCard title="Call volume trend" subtitle="Inbound vs outbound, daily">
+@@ -76,27 +82,28 @@ export function CallActivity() {
+       </ChartCard>
+ 
+       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+-        <ChartCard title="Call outcomes" subtitle="All calls in range, by result. Click a bar to list its callers.">
++        <ChartCard title="Call outcomes" subtitle="Phone calls in range, by result. Click a bar to list its callers.">
+           <HorizontalBarChart
+             data={outcomes.map((o) => ({ name: o.result, value: o.count }))}
+-            colors={outcomes.map((o) => OUTCOME_COLORS[o.result] ?? 'var(--series-7)')}
++            colors={outcomes.map((o) => outcomeColor(o.result))}
+             height={Math.max(220, outcomes.length * 28)}
+             onSelect={(result) => showCallers(metricForResult(result))}
+             selected={resultForMetric(metric)}
+           />
+         </ChartCard>
+-        <ChartCard title="Calls by department" subtitle="Full breakdown, ranked by volume">
+-          <HorizontalBarChart data={departments.map((d) => ({ name: d.department, value: d.total }))} color="var(--series-1)" />
+-        </ChartCard>
++        <GroupVolumeCard records={callsInRange} noun="calls" />
+       </div>
+ 
+       <div ref={callersRef} className="scroll-mt-4">
+-        <CallerBreakdown calls={callsInRange} metric={metric} onMetricChange={setMetric} />
++        <CallerBreakdown calls={callsInRange} metric={metric} onMetricChange={setMetric} timeZone={timeZone} />
+       </div>
+ 
+-      <ChartCard title="When calls happen" subtitle="Call volume by day of week and hour (business hours)">
+-        <Heatmap rows={heatmap.rows} hours={heatmap.hours} days={heatmap.days} />
+-      </ChartCard>
++      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
++        <ChartCard title="When calls happen" subtitle={`Calls by day of week and hour, ${zone} time`} className={hasFax ? 'lg:col-span-2' : 'lg:col-span-3'}>
++          <Heatmap rows={heatmap.rows} hours={heatmap.hours} days={heatmap.days} outside={heatmap.outside} />
++        </ChartCard>
++        {hasFax && <FaxActivityCard fax={faxInRange} />}
++      </div>
+     </div>
+   )
+ }
+diff --git a/src/sections/Messaging.tsx b/src/sections/Messaging.tsx
+index d584409..3ac4d4c 100644
+--- a/src/sections/Messaging.tsx
++++ b/src/sections/Messaging.tsx
+@@ -3,51 +3,52 @@ import { useFilteredData } from '../state/useFilteredData'
+ import { StatTile } from '../components/ui/StatTile'
+ import { ChartCard } from '../components/ui/ChartCard'
+ import { VolumeAreaChart } from '../components/charts/VolumeAreaChart'
+-import { HorizontalBarChart } from '../components/charts/HorizontalBarChart'
+-import { pctDelta, smsByDepartment, smsDailyVolume, smsKpis } from '../lib/metrics'
+-import { formatNumber, formatPercent } from '../lib/format'
++import { GroupVolumeCard } from '../components/GroupVolumeCard'
++import { pctDelta, smsDailyVolume, smsKpis } from '../lib/metrics'
++import { compareLabel, formatNumber, formatPercent } from '../lib/format'
+ 
+ export function Messaging() {
+-  const { smsInRange, smsPrior, loading } = useFilteredData()
++  const { smsInRange, smsPrior, timeZone, loading } = useFilteredData()
+ 
+   const kpis = useMemo(() => {
+     const cur = smsKpis(smsInRange)
+     const prior = smsKpis(smsPrior)
+     return {
+-      total: cur.total,
++      ...cur,
+       totalDelta: pctDelta(cur.total, prior.total),
+-      inbound: cur.inbound,
+       inboundDelta: pctDelta(cur.inbound, prior.inbound),
+-      outbound: cur.outbound,
+       outboundDelta: pctDelta(cur.outbound, prior.outbound),
+-      deliveryRate: cur.deliveryRate,
+-      deliveryRateDelta: pctDelta(cur.deliveryRate, prior.deliveryRate),
++      deliveryRateDelta: prior.outbound > 0 ? pctDelta(cur.deliveryRate, prior.deliveryRate) : null,
+     }
+   }, [smsInRange, smsPrior])
+ 
+-  const volume = useMemo(() => smsDailyVolume(smsInRange), [smsInRange])
+-  const byDept = useMemo(() => smsByDepartment(smsInRange), [smsInRange])
++  const volume = useMemo(() => smsDailyVolume(smsInRange, timeZone), [smsInRange, timeZone])
+ 
+   if (loading) {
+     return <div className="text-sm py-12 text-center" style={{ color: 'var(--text-muted)' }}>Loading messaging data&hellip;</div>
+   }
+ 
++  const compare = compareLabel(smsPrior.length > 0)
++
+   return (
+     <div className="flex flex-col gap-5">
+       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+-        <StatTile label="Total messages" value={formatNumber(kpis.total)} delta={kpis.totalDelta} sublabel="vs prior period" />
+-        <StatTile label="Inbound" value={formatNumber(kpis.inbound)} delta={kpis.inboundDelta} sublabel="vs prior period" />
+-        <StatTile label="Outbound" value={formatNumber(kpis.outbound)} delta={kpis.outboundDelta} sublabel="vs prior period" />
+-        <StatTile label="Delivery rate" value={formatPercent(kpis.deliveryRate, 1)} delta={kpis.deliveryRateDelta} sublabel="vs prior period" />
++        <StatTile label="Total messages" value={formatNumber(kpis.total)} delta={kpis.totalDelta} sublabel={compare} />
++        <StatTile label="Inbound" value={formatNumber(kpis.inbound)} delta={kpis.inboundDelta} sublabel={compare} />
++        <StatTile label="Outbound" value={formatNumber(kpis.outbound)} delta={kpis.outboundDelta} sublabel={compare} />
++        <StatTile
++          label="Delivery rate"
++          value={kpis.outbound > 0 ? formatPercent(kpis.deliveryRate, 1) : '—'}
++          delta={kpis.deliveryRateDelta}
++          sublabel={kpis.outbound > 0 ? `${formatNumber(kpis.delivered)} of ${formatNumber(kpis.outbound)} sent` : 'No messages sent'}
++        />
+       </div>
+ 
+       <ChartCard title="SMS volume trend" subtitle="Inbound vs outbound, daily">
+         <VolumeAreaChart data={volume} height={280} />
+       </ChartCard>
+ 
+-      <ChartCard title="Messages by department" subtitle="Total volume across the selected range">
+-        <HorizontalBarChart data={byDept.map((d) => ({ name: d.department, value: d.count }))} color="var(--series-5)" />
+-      </ChartCard>
++      <GroupVolumeCard records={smsInRange} noun="messages" color="var(--series-5)" />
+     </div>
+   )
+ }
+diff --git a/src/sections/Overview.tsx b/src/sections/Overview.tsx
+index 921f3bc..a8fcc7d 100644
+--- a/src/sections/Overview.tsx
++++ b/src/sections/Overview.tsx
+@@ -6,25 +6,11 @@ import { ChartCard } from '../components/ui/ChartCard'
+ import { VolumeAreaChart } from '../components/charts/VolumeAreaChart'
+ import { ServiceLevelChart } from '../components/charts/ServiceLevelChart'
+ import { HorizontalBarChart } from '../components/charts/HorizontalBarChart'
+-import {
+-  callKpis,
+-  callOutcomeBreakdown,
+-  dailyCallVolume,
+-  departmentLeaderboard,
+-  pctDelta,
+-  qosDailyTrend,
+-  qosKpis,
+-  smsKpis,
+-} from '../lib/metrics'
+-import { formatCompact, formatDuration, formatNumber, formatPercent } from '../lib/format'
+-
+-const OUTCOME_COLORS: Record<string, string> = {
+-  'Call connected': 'var(--status-good)',
+-  Missed: 'var(--status-critical)',
+-  Voicemail: 'var(--series-1)',
+-  Rejected: 'var(--status-serious)',
+-  Busy: 'var(--status-warning)',
+-}
++import { FaxActivityCard } from '../components/FaxActivityCard'
++import { GroupVolumeCard } from '../components/GroupVolumeCard'
++import { callKpis, callOutcomeBreakdown, dailyCallVolume, faxKpis, pctDelta, qosDailyTrend, qosKpis, smsKpis } from '../lib/metrics'
++import { compareLabel, formatCompact, formatDuration, formatNumber, formatPercent } from '../lib/format'
++import { outcomeColor } from '../lib/outcomeColors'
+ 
+ function NoDataNote({ children }: { children: string }) {
+   return (
+@@ -40,80 +26,103 @@ export function Overview() {
+   const hasCalls = calls.records.length > 0
+   const hasQos = qos.records.length > 0
+   const hasSms = sms.records.length > 0
+-  const { callsInRange, qosInRange, smsInRange, callsPrior, qosPrior, smsPrior, loading } = useFilteredData()
++  const { callsInRange, faxInRange, qosInRange, smsInRange, callsPrior, faxPrior, qosPrior, smsPrior, timeZone, loading } = useFilteredData()
+ 
+   const kpis = useMemo(() => {
+-    const calls = callKpis(callsInRange)
+-    const callsPriorK = callKpis(callsPrior)
+-    const qos = qosKpis(qosInRange)
++    const cur = callKpis(callsInRange)
++    const prior = callKpis(callsPrior)
++    const qosCur = qosKpis(qosInRange)
+     const qosPriorK = qosKpis(qosPrior)
+-    const sms = smsKpis(smsInRange)
++    const smsCur = smsKpis(smsInRange)
+     const smsPriorK = smsKpis(smsPrior)
++    const fax = faxKpis(faxInRange)
+     return {
+-      totalCalls: calls.total,
+-      totalCallsDelta: pctDelta(calls.total, callsPriorK.total),
+-      answerRate: calls.answerRate,
+-      answerRateDelta: pctDelta(calls.answerRate, callsPriorK.answerRate),
+-      avgDuration: calls.avgDuration,
+-      avgDurationDelta: pctDelta(calls.avgDuration, callsPriorK.avgDuration),
+-      serviceLevel: qos.avgServiceLevel,
+-      serviceLevelDelta: pctDelta(qos.avgServiceLevel, qosPriorK.avgServiceLevel),
+-      abandonRate: qos.abandonRate,
+-      abandonRateDelta: pctDelta(qos.abandonRate, qosPriorK.abandonRate),
+-      totalSms: sms.total,
+-      totalSmsDelta: pctDelta(sms.total, smsPriorK.total),
++      calls: cur,
++      fax,
++      totalCallsDelta: pctDelta(cur.total, prior.total),
++      inboundAnswerDelta: prior.inbound > 0 ? pctDelta(cur.inboundAnswerRate, prior.inboundAnswerRate) : null,
++      outboundConnectDelta: prior.outbound > 0 ? pctDelta(cur.outboundConnectRate, prior.outboundConnectRate) : null,
++      avgDurationDelta: pctDelta(cur.avgDuration, prior.avgDuration),
++      faxDelta: pctDelta(fax.total, faxPrior.length),
++      serviceLevel: qosCur.avgServiceLevel,
++      serviceLevelDelta: pctDelta(qosCur.avgServiceLevel, qosPriorK.avgServiceLevel),
++      abandonRate: qosCur.abandonRate,
++      abandonRateDelta: pctDelta(qosCur.abandonRate, qosPriorK.abandonRate),
++      totalSms: smsCur.total,
++      totalSmsDelta: pctDelta(smsCur.total, smsPriorK.total),
+     }
+-  }, [callsInRange, callsPrior, qosInRange, qosPrior, smsInRange, smsPrior])
++  }, [callsInRange, callsPrior, faxInRange, faxPrior, qosInRange, qosPrior, smsInRange, smsPrior])
+ 
+-  const volume = useMemo(() => dailyCallVolume(callsInRange), [callsInRange])
++  const volume = useMemo(() => dailyCallVolume(callsInRange, timeZone), [callsInRange, timeZone])
+   const serviceTrend = useMemo(() => qosDailyTrend(qosInRange), [qosInRange])
+-  const deptLeaderboard = useMemo(() => departmentLeaderboard(callsInRange).slice(0, 6), [callsInRange])
+   const outcomes = useMemo(() => callOutcomeBreakdown(callsInRange), [callsInRange])
+ 
+   if (loading) {
+     return <div className="text-sm py-12 text-center" style={{ color: 'var(--text-muted)' }}>Loading dashboard data&hellip;</div>
+   }
+ 
++  // Period-over-period figures need the earlier period to be loaded; say so when it isn't.
++  const callsCompare = compareLabel(callsPrior.length > 0)
++  const { calls: c, fax } = kpis
++  // Faxes share RingCentral's call log. They get their own tile whenever the account has any.
++  const hasFax = calls.records.some((r) => r.kind === 'fax')
++  // Service level and abandon rate only exist for call queues, so they appear only once queue data is loaded.
++  const tileCount = 5 + (hasQos ? 2 : 0) + (hasFax ? 1 : 0)
++  const tileGrid = tileCount > 6 ? 'grid grid-cols-2 sm:grid-cols-4 gap-3' : 'grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3'
++
+   return (
+     <div className="flex flex-col gap-5">
+-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
++      <div className={tileGrid}>
+         <StatTile
+           label="Total calls"
+-          value={hasCalls ? formatNumber(kpis.totalCalls) : '—'}
++          value={hasCalls ? formatNumber(c.total) : '—'}
+           delta={hasCalls ? kpis.totalCallsDelta : undefined}
+-          sublabel={hasCalls ? 'vs prior period' : 'No call data'}
+-        />
+-        <StatTile
+-          label="Answer rate"
+-          value={hasCalls ? formatPercent(kpis.answerRate) : '—'}
+-          delta={hasCalls ? kpis.answerRateDelta : undefined}
+-          sublabel={hasCalls ? 'vs prior period' : 'No call data'}
++          sublabel={hasCalls ? callsCompare : 'No call data'}
+         />
+         <StatTile
+-          label="Avg call duration"
+-          value={hasCalls ? formatDuration(kpis.avgDuration) : '—'}
+-          delta={hasCalls ? kpis.avgDurationDelta : undefined}
+-          deltaGoodDirection="down"
+-          sublabel={hasCalls ? 'vs prior period' : 'No call data'}
++          label="Inbound answered"
++          value={hasCalls && c.inbound > 0 ? formatPercent(c.inboundAnswerRate) : '—'}
++          delta={hasCalls ? kpis.inboundAnswerDelta : undefined}
++          sublabel={hasCalls ? (c.inbound > 0 ? `${formatNumber(c.inboundAnswered)} of ${formatNumber(c.inbound)} inbound` : 'No inbound calls') : 'No call data'}
+         />
+         <StatTile
+-          label="Service level"
+-          value={hasQos ? formatPercent(kpis.serviceLevel) : '—'}
+-          delta={hasQos ? kpis.serviceLevelDelta : undefined}
+-          sublabel={hasQos ? 'target 85%' : 'No analytics data'}
++          label="Outbound connected"
++          value={hasCalls && c.outbound > 0 ? formatPercent(c.outboundConnectRate) : '—'}
++          delta={hasCalls ? kpis.outboundConnectDelta : undefined}
++          sublabel={hasCalls ? (c.outbound > 0 ? `${formatNumber(c.outboundConnected)} of ${formatNumber(c.outbound)} outbound` : 'No outbound calls') : 'No call data'}
+         />
+         <StatTile
+-          label="Abandon rate"
+-          value={hasQos ? formatPercent(kpis.abandonRate, 1) : '—'}
+-          delta={hasQos ? kpis.abandonRateDelta : undefined}
++          label="Avg call duration"
++          value={hasCalls ? formatDuration(c.avgDuration) : '—'}
++          delta={hasCalls ? kpis.avgDurationDelta : undefined}
+           deltaGoodDirection="down"
+-          sublabel={hasQos ? 'vs prior period' : 'No analytics data'}
++          sublabel={hasCalls ? callsCompare : 'No call data'}
+         />
++        {hasQos && (
++          <>
++            <StatTile label="Service level" value={formatPercent(kpis.serviceLevel)} delta={kpis.serviceLevelDelta} sublabel="target 85%" />
++            <StatTile
++              label="Abandon rate"
++              value={formatPercent(kpis.abandonRate, 1)}
++              delta={kpis.abandonRateDelta}
++              deltaGoodDirection="down"
++              sublabel={compareLabel(qosPrior.length > 0)}
++            />
++          </>
++        )}
++        {hasFax && (
++          <StatTile
++            label="Faxes"
++            value={formatNumber(fax.total)}
++            delta={kpis.faxDelta}
++            sublabel={`${formatNumber(fax.sent)} sent, ${formatNumber(fax.received)} received`}
++          />
++        )}
+         <StatTile
+           label="SMS volume"
+           value={hasSms ? formatCompact(kpis.totalSms) : '—'}
+           delta={hasSms ? kpis.totalSmsDelta : undefined}
+-          sublabel={hasSms ? 'vs prior period' : 'No SMS data'}
++          sublabel={hasSms ? compareLabel(smsPrior.length > 0) : 'No SMS data'}
+         />
+       </div>
+ 
+@@ -121,12 +130,12 @@ export function Overview() {
+         <ChartCard title="Call volume trend" subtitle="Inbound vs outbound, daily" className="lg:col-span-2">
+           {hasCalls ? <VolumeAreaChart data={volume} /> : <NoDataNote>No call data loaded yet.</NoDataNote>}
+         </ChartCard>
+-        <ChartCard title="Call outcomes" subtitle="Share of all calls in range">
++        <ChartCard title="Call outcomes" subtitle="Phone calls in range, by result">
+           {hasCalls ? (
+             <HorizontalBarChart
+               data={outcomes.map((o) => ({ name: o.result, value: o.count }))}
+-              colors={outcomes.map((o) => OUTCOME_COLORS[o.result] ?? 'var(--series-7)')}
+-              height={220}
++              colors={outcomes.map((o) => outcomeColor(o.result))}
++              height={Math.max(220, outcomes.length * 28)}
+             />
+           ) : (
+             <NoDataNote>No call data loaded yet.</NoDataNote>
+@@ -135,20 +144,19 @@ export function Overview() {
+       </div>
+ 
+       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+-        <ChartCard title="Service level trend" subtitle="Daily average across all queues" className="lg:col-span-2">
+-          {hasQos ? (
+-            <ServiceLevelChart data={serviceTrend.map((d) => ({ date: d.date, serviceLevel: d.serviceLevel }))} />
+-          ) : (
+-            <NoDataNote>Service level comes from the RingCentral Analytics export. Upload it with Upload data.</NoDataNote>
+-          )}
+-        </ChartCard>
+-        <ChartCard title="Volume by department" subtitle="Top departments by call count">
+-          {hasCalls ? (
+-            <HorizontalBarChart data={deptLeaderboard.map((d) => ({ name: d.department, value: d.total }))} color="var(--series-1)" />
+-          ) : (
+-            <NoDataNote>No call data loaded yet.</NoDataNote>
+-          )}
+-        </ChartCard>
++        {hasQos ? (
++          <>
++            <ChartCard title="Service level trend" subtitle="Daily average across all queues" className="lg:col-span-2">
++              <ServiceLevelChart data={serviceTrend.map((d) => ({ date: d.date, serviceLevel: d.serviceLevel }))} />
++            </ChartCard>
++            <GroupVolumeCard records={callsInRange} noun="calls" limit={6} />
++          </>
++        ) : (
++          <>
++            <GroupVolumeCard records={callsInRange} noun="calls" limit={8} className={hasFax ? 'lg:col-span-2' : 'lg:col-span-3'} />
++            {hasFax && <FaxActivityCard fax={faxInRange} />}
++          </>
++        )}
+       </div>
+     </div>
+   )
+diff --git a/src/sections/Settings.tsx b/src/sections/Settings.tsx
+index 74277ee..e81bacb 100644
+--- a/src/sections/Settings.tsx
++++ b/src/sections/Settings.tsx
+@@ -2,6 +2,8 @@ import { useState } from 'react'
+ import { ChartCard } from '../components/ui/ChartCard'
+ import { StatusBadge } from '../components/ui/Badge'
+ import { useRingCentral } from '../state/RingCentralContext'
++import { useData } from '../state/DataContext'
++import { browserTimeZone, listTimeZones, timeZoneAbbreviation } from '../lib/timezone'
+ 
+ const inputStyle = { border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }
+ const secondaryButtonStyle = { border: '1px solid var(--border)', color: 'var(--text-secondary)' }
+@@ -98,6 +100,7 @@ function ConnectedCard() {
+           {rc.hasPassword && rc.remembered && <span>The dashboard password is remembered on this browser. "Lock this browser" removes it.</span>}
+           {rc.smsSkipped !== null && rc.smsSkipped > 0 && <span>{rc.smsSkipped} user(s) skipped for SMS — likely a permissions/scope issue on that mailbox.</span>}
+           {rc.qosNote && <span>{rc.qosNote}</span>}
++          {rc.compareNote && <span>{rc.compareNote}</span>}
+         </div>
+ 
+         {rc.lastError && <ErrorBox message={rc.lastError} />}
+@@ -150,7 +153,7 @@ function UnlockCard() {
+         </button>
+         <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+           This is the password set on the dashboard server, not your RingCentral password. Leave "Remember" unchecked on shared computers.
+-          Once unlocked, the last {30} days of calls, SMS and service quality import automatically.
++          Once unlocked, the last {30} days of calls, SMS and service quality import automatically, followed by the 30 days before for comparison.
+         </p>
+       </form>
+     </ChartCard>
+@@ -235,6 +238,40 @@ function SetupGuide() {
+   )
+ }
+ 
++const ZONES = listTimeZones()
++
++function TimeZoneCard() {
++  const { timeZone, timeZoneChoice, setTimeZoneChoice, accountTimeZone } = useData()
++  const automatic = accountTimeZone ? `RingCentral account (${accountTimeZone})` : `this browser (${browserTimeZone()})`
++  // A saved zone the browser's list doesn't name (an alias such as "US/Pacific") still needs an option.
++  const options = timeZoneChoice && !ZONES.includes(timeZoneChoice) ? [timeZoneChoice, ...ZONES] : ZONES
++
++  return (
++    <ChartCard title="Time zone" subtitle="Days, hours and call times across the dashboard are counted on this clock">
++      <div className="flex flex-col gap-2">
++        <select
++          aria-label="Dashboard time zone"
++          value={timeZoneChoice ?? ''}
++          onChange={(e) => setTimeZoneChoice(e.target.value || null)}
++          className="rounded-md px-2 py-1.5 text-sm max-w-md"
++          style={inputStyle}
++        >
++          <option value="">Automatic: {automatic}</option>
++          {options.map((zone) => (
++            <option key={zone} value={zone}>
++              {zone}
++            </option>
++          ))}
++        </select>
++        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
++          Now using {timeZone} ({timeZoneAbbreviation(timeZone)}). Set it to where the team works, so a call at 9am there shows as 9am here wherever
++          the dashboard is opened. Saved on this browser.
++        </p>
++      </div>
++    </ChartCard>
++  )
++}
++
+ function DepartmentMapEditor() {
+   const rc = useRingCentral()
+   const entries = Object.entries(rc.departmentMap)
+@@ -255,11 +292,11 @@ function DepartmentMapEditor() {
+   }
+ 
+   return (
+-    <ChartCard title="Department mapping" subtitle="RingCentral doesn't tag calls with a department, so map extension numbers to department names here">
++    <ChartCard title="Department mapping" subtitle="Departments come from each extension's Department field in RingCentral. Add or override them here by extension number; applies from the next import.">
+       <div className="flex flex-col gap-2">
+         {entries.length === 0 && (
+           <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+-            No mappings yet — anything unmapped shows as "Unassigned".
++            No mappings yet. Extensions with no department in RingCentral and none here are grouped by team member instead.
+           </p>
+         )}
+         {entries.map(([ext, dept]) => (
+@@ -303,6 +340,7 @@ export function Settings() {
+   return (
+     <div className="flex flex-col gap-5">
+       <ConnectionCard />
++      <TimeZoneCard />
+       <DepartmentMapEditor />
+       <SetupGuide />
+ 
+diff --git a/src/sections/TeamPerformance.tsx b/src/sections/TeamPerformance.tsx
+index ae33701..81a19f0 100644
+--- a/src/sections/TeamPerformance.tsx
++++ b/src/sections/TeamPerformance.tsx
+@@ -1,8 +1,8 @@
+ import { useMemo, useState } from 'react'
+ import { useFilteredData } from '../state/useFilteredData'
+ import { ChartCard } from '../components/ui/ChartCard'
+-import { HorizontalBarChart } from '../components/charts/HorizontalBarChart'
+-import { agentLeaderboard, departmentLeaderboard, type AgentLeaderboardRow } from '../lib/metrics'
++import { GroupVolumeCard } from '../components/GroupVolumeCard'
++import { agentLeaderboard, hasDepartments, type AgentLeaderboardRow } from '../lib/metrics'
+ import { formatDuration, formatNumber, formatPercent } from '../lib/format'
+ 
+ type SortKey = 'total' | 'inbound' | 'outbound' | 'connected' | 'missed' | 'voicemail' | 'answerRate' | 'avgDuration' | 'talkSeconds'
+@@ -14,7 +14,7 @@ const COLUMNS: { key: SortKey; label: string; format: (row: AgentLeaderboardRow)
+   { key: 'connected', label: 'Connected', format: (r) => formatNumber(r.connected) },
+   { key: 'missed', label: 'Missed', format: (r) => formatNumber(r.missed) },
+   { key: 'voicemail', label: 'Voicemail', format: (r) => formatNumber(r.voicemail) },
+-  { key: 'answerRate', label: 'Answer rate', format: (r) => formatPercent(r.answerRate) },
++  { key: 'answerRate', label: 'Connect rate', format: (r) => formatPercent(r.answerRate) },
+   { key: 'avgDuration', label: 'Avg duration', format: (r) => formatDuration(r.avgDuration) },
+   { key: 'talkSeconds', label: 'Talk time', format: (r) => formatDuration(r.talkSeconds) },
+ ]
+@@ -25,7 +25,8 @@ export function TeamPerformance() {
+   const [staffOnly, setStaffOnly] = useState(true)
+ 
+   const agents = useMemo(() => agentLeaderboard(callsInRange), [callsInRange])
+-  const departments = useMemo(() => departmentLeaderboard(callsInRange), [callsInRange])
++  // Without departments the chart would be one "Unassigned" bar and the column one repeated word.
++  const showDepartments = useMemo(() => hasDepartments(callsInRange), [callsInRange])
+ 
+   const staff = useMemo(() => agents.filter((a) => a.isStaff), [agents])
+   const otherCalls = useMemo(() => agents.filter((a) => !a.isStaff).reduce((sum, a) => sum + a.total, 0), [agents])
+@@ -61,11 +62,9 @@ export function TeamPerformance() {
+ 
+   return (
+     <div className="flex flex-col gap-5">
+-      <ChartCard title="Call volume by department" subtitle="Ranked by total calls in the selected range">
+-        <HorizontalBarChart data={departments.map((d) => ({ name: d.department, value: d.total }))} color="var(--series-1)" />
+-      </ChartCard>
++      {showDepartments && <GroupVolumeCard records={callsInRange} noun="calls" />}
+ 
+-      <ChartCard title="Agent leaderboard" subtitle="Each metric per team member. Click a column to rank by it." action={toggle}>
++      <ChartCard title="Agent leaderboard" subtitle="Phone calls per team member (faxes excluded). Click a column to rank by it." action={toggle}>
+         {sorted.length === 0 ? (
+           <p className="text-sm py-6 text-center" style={{ color: 'var(--text-muted)' }}>
+             {agents.length === 0 ? 'No calls in this date range.' : 'No calls in this range are tied to a team member. Switch to All lines to see them.'}
+@@ -78,9 +77,11 @@ export function TeamPerformance() {
+                   <th className="text-left font-medium px-2 py-2" style={{ color: 'var(--text-muted)' }}>
+                     Agent
+                   </th>
+-                  <th className="text-left font-medium px-2 py-2" style={{ color: 'var(--text-muted)' }}>
+-                    Department
+-                  </th>
++                  {showDepartments && (
++                    <th className="text-left font-medium px-2 py-2" style={{ color: 'var(--text-muted)' }}>
++                      Department
++                    </th>
++                  )}
+                   {COLUMNS.map((c) => (
+                     <th key={c.key} className="text-right font-medium px-2 py-2 whitespace-nowrap" aria-sort={sortKey === c.key ? 'descending' : undefined}>
+                       <button
+@@ -107,9 +108,11 @@ export function TeamPerformance() {
+                         </span>
+                       )}
+                     </td>
+-                    <td className="px-2 py-2" style={{ color: 'var(--text-secondary)' }}>
+-                      {a.department}
+-                    </td>
++                    {showDepartments && (
++                      <td className="px-2 py-2" style={{ color: 'var(--text-secondary)' }}>
++                        {a.department}
++                      </td>
++                    )}
+                     {COLUMNS.map((c) => (
+                       <td key={c.key} className="px-2 py-2 text-right tabular-nums whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
+                         {c.format(a)}
+@@ -123,7 +126,7 @@ export function TeamPerformance() {
+         )}
+         {staffOnly && otherCalls > 0 && (
+           <p className="text-xs mt-3" style={{ color: 'var(--text-muted)' }}>
+-            {formatNumber(otherCalls)} {otherCalls === 1 ? 'call is' : 'calls are'} not tied to a team member (main line, queues, or calls nobody picked up). Switch to All lines to
++            {formatNumber(otherCalls)} {otherCalls === 1 ? 'call is' : 'calls are'} not tied to a team member (company lines, queues, or calls nobody picked up). Switch to All lines to
+             see them.
+           </p>
+         )}
+diff --git a/src/state/DataContext.tsx b/src/state/DataContext.tsx
+index b5e7d81..0eecb47 100644
+--- a/src/state/DataContext.tsx
++++ b/src/state/DataContext.tsx
+@@ -1,6 +1,7 @@
+ import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+ import type { CallRecord, DatasetSource, DateRange, DateRangePreset, QosRecord, SmsRecord } from '../types'
+ import { parseCallLogCsv, parseQosCsv, parseSmsCsv } from '../lib/parsers'
++import { browserTimeZone, isValidTimeZone, zonedDayStart, zonedMonthStart } from '../lib/timezone'
+ 
+ interface DatasetState<T> {
+   records: T[]
+@@ -29,6 +30,25 @@ interface DataContextValue {
+   setCustomRange: (r: DateRange) => void
+   customRange: DateRange | null
+   dataBounds: DateRange | null
++  /** The zone days, hours and displayed times are worked out in. */
++  timeZone: string
++  /** The zone picked in Settings, or null to follow the RingCentral account (else this browser). */
++  timeZoneChoice: string | null
++  setTimeZoneChoice: (timeZone: string | null) => void
++  /** The zone RingCentral reports for the account; null until live data is connected. */
++  accountTimeZone: string | null
++  setAccountTimeZone: (timeZone: string | null) => void
++}
++
++const TIME_ZONE_KEY = 'rc_dashboard_timezone'
++
++function loadTimeZoneChoice(): string | null {
++  try {
++    const saved = localStorage.getItem(TIME_ZONE_KEY)
++    return isValidTimeZone(saved) ? saved : null
++  } catch {
++    return null
++  }
+ }
+ 
+ const DataContext = createContext<DataContextValue | null>(null)
+@@ -47,16 +67,13 @@ function computeBounds(dates: Date[]): DateRange | null {
+   return { start: new Date(min), end: new Date(max) }
+ }
+ 
+-function presetToRange(preset: DateRangePreset, bounds: DateRange | null): DateRange | null {
++/** Presets count whole calendar days in the dashboard's time zone, ending on the day of the latest record. */
++function presetToRange(preset: DateRangePreset, bounds: DateRange | null, timeZone: string): DateRange | null {
+   if (!bounds) return null
+   const end = bounds.end
+   if (preset === 'all' || preset === 'custom') return bounds
+-  if (preset === 'mtd') {
+-    const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1))
+-    return { start: start < bounds.start ? bounds.start : start, end }
+-  }
+   const days = preset === '7d' ? 7 : preset === '30d' ? 30 : 90
+-  const start = new Date(end.getTime() - (days - 1) * 86400000)
++  const start = preset === 'mtd' ? zonedMonthStart(end, timeZone) : zonedDayStart(end, timeZone, -(days - 1))
+   return { start: start < bounds.start ? bounds.start : start, end }
+ }
+ 
+@@ -66,6 +83,24 @@ export function DataProvider({ children }: { children: ReactNode }) {
+   const [sms, setSms] = useState<DatasetState<SmsRecord>>(initial<SmsRecord>())
+   const [preset, setPreset] = useState<DateRangePreset>('30d')
+   const [customRange, setCustomRangeState] = useState<DateRange | null>(null)
++  const [timeZoneChoice, setTimeZoneChoiceState] = useState<string | null>(() => loadTimeZoneChoice())
++  const [accountTimeZone, setAccountTimeZoneState] = useState<string | null>(null)
++  const timeZone = useMemo(() => timeZoneChoice ?? accountTimeZone ?? browserTimeZone(), [timeZoneChoice, accountTimeZone])
++
++  const setTimeZoneChoice = useCallback((next: string | null) => {
++    const value = isValidTimeZone(next) ? next : null
++    setTimeZoneChoiceState(value)
++    try {
++      if (value) localStorage.setItem(TIME_ZONE_KEY, value)
++      else localStorage.removeItem(TIME_ZONE_KEY)
++    } catch {
++      // ignore — the choice just won't persist across sessions
++    }
++  }, [])
++
++  const setAccountTimeZone = useCallback((next: string | null) => {
++    setAccountTimeZoneState(isValidTimeZone(next) ? next : null)
++  }, [])
+ 
+   const setCustomRange = useCallback((r: DateRange) => {
+     setCustomRangeState(r)
+@@ -160,8 +195,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
+   }, [calls.records, qos.records, sms.records])
+ 
+   const range = useMemo(
+-    () => (preset === 'custom' && customRange ? customRange : presetToRange(preset, dataBounds)),
+-    [preset, customRange, dataBounds],
++    () => (preset === 'custom' && customRange ? customRange : presetToRange(preset, dataBounds, timeZone)),
++    [preset, customRange, dataBounds, timeZone],
+   )
+ 
+   const value: DataContextValue = {
+@@ -181,6 +216,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
+     setCustomRange,
+     customRange,
+     dataBounds,
++    timeZone,
++    timeZoneChoice,
++    setTimeZoneChoice,
++    accountTimeZone,
++    setAccountTimeZone,
+   }
+ 
+   return <DataContext.Provider value={value}>{children}</DataContext.Provider>
+diff --git a/src/state/RingCentralContext.tsx b/src/state/RingCentralContext.tsx
+index 1e38118..bb57d37 100644
+--- a/src/state/RingCentralContext.tsx
++++ b/src/state/RingCentralContext.tsx
+@@ -5,6 +5,31 @@ import { loadDepartmentMap, saveDepartmentMap, type DepartmentMap } from '../lib
+ import { useData } from './DataContext'
+ 
+ const AUTO_SYNC_DAYS = 30
++const DAY_MS = 86_400_000
++/** Longer windows skip the comparison import: it would double an already long fetch. */
++const COMPARE_MAX_DAYS = 92
++
++/**
++ * The window to import so "vs prior period" has something to compare against.
++ * For "last N days" the date presets end at the latest record rather than at now, so the
++ * comparison reaches back 2N days from that record.
++ */
++function comparisonWindow(window: SyncWindow, latestRecord: number | null): { start: Date; end: Date } | null {
++  if (typeof window === 'number') {
++    if (window > COMPARE_MAX_DAYS) return null
++    const now = Date.now()
++    return { start: new Date((latestRecord ?? now) - 2 * window * DAY_MS), end: new Date(now - window * DAY_MS - 1) }
++  }
++  const lengthMs = window.end.getTime() - window.start.getTime()
++  if (lengthMs <= 0 || lengthMs > COMPARE_MAX_DAYS * DAY_MS) return null
++  const end = window.start.getTime() - 1
++  return { start: new Date(end - lengthMs), end: new Date(end) }
++}
++
++function mergeById<T>(primary: T[], extra: T[], idOf: (record: T) => string): T[] {
++  const seen = new Set(primary.map(idOf))
++  return [...primary, ...extra.filter((r) => !seen.has(idOf(r)))]
++}
+ 
+ /**
+  * Where the dashboard's server-side RingCentral connection stands:
+@@ -37,6 +62,8 @@ interface RingCentralContextValue {
+   smsSkipped: number | null
+   /** Anything worth knowing about the last service-quality import. */
+   qosNote: string | null
++  /** Set when the previous period couldn't be imported, so period-over-period figures are missing. */
++  compareNote: string | null
+   departmentMap: DepartmentMap
+   unlock: (password: string, remember: boolean) => Promise<void>
+   /** Forgets the dashboard password on this browser. */
+@@ -53,7 +80,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+ const isLocked = (e: unknown) => e instanceof ApiError && e.status === 401
+ 
+ export function RingCentralProvider({ children }: { children: ReactNode }) {
+-  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral } = useData()
++  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, setAccountTimeZone } = useData()
+   const [backend, setBackend] = useState<BackendState>('checking')
+   const [backendMessage, setBackendMessage] = useState<string | null>(null)
+   const [user, setUser] = useState<RcUser | null>(null)
+@@ -68,6 +95,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+   const [lastError, setLastError] = useState<string | null>(null)
+   const [smsSkipped, setSmsSkipped] = useState<number | null>(null)
+   const [qosNote, setQosNote] = useState<string | null>(null)
++  const [compareNote, setCompareNote] = useState<string | null>(null)
+   const [departmentMap, setDepartmentMap] = useState<DepartmentMap>(() => loadDepartmentMap())
+   // A ref so syncs started from long-lived callbacks always use the latest mapping.
+   const deptRef = useRef(departmentMap)
+@@ -106,14 +134,18 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       setSyncing(true)
+       setLastError(null)
+       setQosNote(null)
++      setCompareNote(null)
+       const errors: string[] = []
+       let anySucceeded = false
+       let locked: unknown = null
+       const scopes: DataScope[] = []
+ 
+       // Sequential on purpose: RingCentral rate-limits these APIs, so don't double the load.
++      let calls: Awaited<ReturnType<typeof syncCallLog>> | null = null
++      let sms: Awaited<ReturnType<typeof syncSms>> | null = null
++      let qosLoaded: Awaited<ReturnType<typeof syncQos>>['records'] = []
+       try {
+-        const calls = await syncCallLog(deptRef.current, window, setSyncStatus)
++        calls = await syncCallLog(deptRef.current, window, setSyncStatus)
+         setCallsFromRingCentral(calls.records, label)
+         scopes.push(calls.scope)
+         anySucceeded = true
+@@ -123,7 +155,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       }
+       if (!locked) {
+         try {
+-          const sms = await syncSms(deptRef.current, window, setSyncStatus)
++          sms = await syncSms(deptRef.current, window, setSyncStatus)
+           setSmsFromRingCentral(sms.records, label)
+           setSmsSkipped(sms.skippedExtensions)
+           scopes.push(sms.scope)
+@@ -140,6 +172,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+           // An empty answer leaves any uploaded Analytics export in place rather than blanking the tab.
+           if (qos.records.length > 0) setQosFromRingCentral(qos.records, label)
+           else notes.push('RingCentral Analytics returned no call-queue data for this period.')
++          qosLoaded = qos.records
+           if (qos.skippedNoSla > 0) notes.push(`${qos.skippedNoSla} queue-day(s) had calls but no SLA classification and are left out of Service Quality.`)
+           if (qos.clampedToDays) notes.push(`RingCentral Analytics only keeps about ${qos.clampedToDays} days, so earlier dates have no service quality data.`)
+           setQosNote(notes.length > 0 ? notes.join(' ') : null)
+@@ -150,6 +183,33 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+         }
+       }
+ 
++      // The period just before, so the tiles can say how this one compares. It loads after the
++      // requested period is already on screen, and a failure here only costs the comparison.
++      const latest = [...(calls?.records ?? []).map((c) => c.startTime.getTime()), ...(sms?.records ?? []).map((m) => m.dateTime.getTime())]
++      const before = comparisonWindow(window, latest.length > 0 ? latest.reduce((a, b) => (a > b ? a : b)) : null)
++      if (!locked && before && (calls || sms)) {
++        const comparing = (text: string) => setSyncStatus(`Previous period, for comparison — ${text.charAt(0).toLowerCase()}${text.slice(1)}`)
++        try {
++          if (calls) {
++            const earlier = await syncCallLog(deptRef.current, before, comparing)
++            setCallsFromRingCentral(mergeById(calls.records, earlier.records, (c) => c.callId), label)
++          }
++          if (sms) {
++            const earlier = await syncSms(deptRef.current, before, comparing)
++            setSmsFromRingCentral(mergeById(sms.records, earlier.records, (m) => m.messageId), label)
++          }
++          if (qosLoaded.length > 0) {
++            const earlier = await syncQos(before, comparing)
++            setQosFromRingCentral([...qosLoaded, ...earlier.records], label)
++          }
++        } catch (e) {
++          if (isLocked(e)) locked = e
++          else setCompareNote(`The previous period couldn't be imported, so some "vs prior period" figures are missing (${message(e)}).`)
++        }
++      } else if (!locked && !before && anySucceeded) {
++        setCompareNote(`Ranges longer than ${COMPARE_MAX_DAYS} days are imported without the period before them, so they show no "vs prior period" figures.`)
++      }
++
+       if (locked) applyFailure(locked)
+       if (scopes.length > 0) setScope(scopes.includes('self') ? 'self' : 'company')
+       if (errors.length > 0) setLastError(errors.join(' | '))
+@@ -167,6 +227,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       const status = await fetchStatus()
+       setUser(status.user)
+       setEnvironment(status.environment)
++      setAccountTimeZone(status.timeZone ?? null)
+       setBackend('connected')
+       setBackendMessage(null)
+       setConnecting(false)
+@@ -175,7 +236,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       applyFailure(e)
+       setConnecting(false)
+     }
+-  }, [syncNow, applyFailure])
++  }, [syncNow, applyFailure, setAccountTimeZone])
+ 
+   const started = useRef(false)
+   useEffect(() => {
+@@ -204,6 +265,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+     setLastError(null)
+     setSmsSkipped(null)
+     setQosNote(null)
++    setCompareNote(null)
+     setBackend('locked')
+     setBackendMessage(null)
+   }, [])
+@@ -231,6 +293,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       lastError,
+       smsSkipped,
+       qosNote,
++      compareNote,
+       departmentMap,
+       unlock,
+       lock,
+@@ -253,6 +316,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
+       lastError,
+       smsSkipped,
+       qosNote,
++      compareNote,
+       departmentMap,
+       unlock,
+       lock,
+diff --git a/src/state/useFilteredData.ts b/src/state/useFilteredData.ts
+index 897afd6..4779628 100644
+--- a/src/state/useFilteredData.ts
++++ b/src/state/useFilteredData.ts
+@@ -1,31 +1,33 @@
+ import { useMemo } from 'react'
+ import { useData } from './DataContext'
+-import { filterByRange, priorRange } from '../lib/metrics'
++import { filterByRange, priorRange, splitByKind } from '../lib/metrics'
+ 
++/**
++ * The records inside the selected date range and inside the equal-length window before it.
++ * `calls*` hold phone calls only; faxes from the same RingCentral log are in `fax*`.
++ */
+ export function useFilteredData() {
+-  const { calls, qos, sms, range } = useData()
++  const { calls, qos, sms, range, timeZone } = useData()
+ 
+   return useMemo(() => {
++    const loading = calls.loading || qos.loading || sms.loading
+     if (!range) {
+-      return {
+-        callsInRange: [],
+-        qosInRange: [],
+-        smsInRange: [],
+-        callsPrior: [],
+-        qosPrior: [],
+-        smsPrior: [],
+-        loading: calls.loading || qos.loading || sms.loading,
+-      }
++      return { callsInRange: [], faxInRange: [], qosInRange: [], smsInRange: [], callsPrior: [], faxPrior: [], qosPrior: [], smsPrior: [], timeZone, loading }
+     }
+     const prior = priorRange(range)
++    const current = splitByKind(filterByRange(calls.records, (c) => c.startTime, range))
++    const before = splitByKind(filterByRange(calls.records, (c) => c.startTime, prior))
+     return {
+-      callsInRange: filterByRange(calls.records, (c) => c.startTime, range),
++      callsInRange: current.voice,
++      faxInRange: current.fax,
+       qosInRange: filterByRange(qos.records, (q) => q.date, range),
+       smsInRange: filterByRange(sms.records, (s) => s.dateTime, range),
+-      callsPrior: filterByRange(calls.records, (c) => c.startTime, prior),
++      callsPrior: before.voice,
++      faxPrior: before.fax,
+       qosPrior: filterByRange(qos.records, (q) => q.date, prior),
+       smsPrior: filterByRange(sms.records, (s) => s.dateTime, prior),
+-      loading: calls.loading || qos.loading || sms.loading,
++      timeZone,
++      loading,
+     }
+-  }, [calls.records, calls.loading, qos.records, qos.loading, sms.records, sms.loading, range])
++  }, [calls.records, calls.loading, qos.records, qos.loading, sms.records, sms.loading, range, timeZone])
+ }
+diff --git a/src/types.ts b/src/types.ts
+index d02d419..14b5b9c 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -1,7 +1,11 @@
+ export type Direction = 'Inbound' | 'Outbound'
+ 
++/** RingCentral's call log holds faxes as well as phone calls; call metrics count only voice. */
++export type CallKind = 'voice' | 'fax'
++
+ export interface CallRecord {
+   callId: string
++  kind: CallKind
+   startTime: Date
+   direction: Direction
+   fromName: string
+diff --git a/test/metrics.test.mjs b/test/metrics.test.mjs
+new file mode 100644
+index 0000000..8ab56fb
+--- /dev/null
++++ b/test/metrics.test.mjs
+@@ -0,0 +1,249 @@
++// The numbers the dashboard shows: voice vs fax, answer rates, time zones, comparisons.
++// Run with `npm test` (Node 22.18+ runs the TypeScript sources directly).
++import { test } from 'node:test'
++import assert from 'node:assert/strict'
++import {
++  callHeatmap,
++  callKindOf,
++  callKpis,
++  callsForMetric,
++  dailyCallVolume,
++  faxKpis,
++  filterByRange,
++  hasDepartments,
++  priorRange,
++  smsKpis,
++  splitByKind,
++  volumeByGroup,
++} from '../src/lib/metrics.ts'
++import { isValidTimeZone, zonedDateKey, zonedDayEnd, zonedDayStart, zonedMidnight, zonedMonthStart, zonedParts } from '../src/lib/timezone.ts'
++import { departmentFor } from '../src/lib/departmentMap.ts'
++import { formatDayKey } from '../src/lib/format.ts'
++
++let seq = 0
++const call = (over = {}) => ({
++  callId: `c${++seq}`,
++  kind: 'voice',
++  startTime: new Date('2026-09-15T15:00:00Z'),
++  direction: 'Outbound',
++  fromName: '',
++  fromNumber: '',
++  toName: '',
++  toNumber: '',
++  extension: '104',
++  extensionName: 'Pat',
++  extensionType: 'User',
++  department: 'Unassigned',
++  durationSeconds: 0,
++  result: 'Call connected',
++  recorded: false,
++  ...over,
++})
++const many = (n, over) => Array.from({ length: n }, () => call(over))
++
++// ---- Voice vs fax ------------------------------------------------------------
++
++test('RingCentral’s own type decides fax vs voice; without it the result does', () => {
++  assert.equal(callKindOf('Fax', 'Wrong Number'), 'fax')
++  assert.equal(callKindOf('Voice', 'Received'), 'voice')
++  for (const result of ['Sent', 'Received', 'Fax Not Sent', 'Receive Error', 'Send Error', 'Partial Receive', 'Fax Partially Sent', 'Fax on Demand']) {
++    assert.equal(callKindOf(undefined, result), 'fax', result)
++  }
++  for (const result of ['Call connected', 'Accepted', 'Missed', 'Voicemail', 'Hang Up', 'Wrong Number', 'Blocked', 'No Answer', 'Rejected']) {
++    assert.equal(callKindOf('', result), 'voice', result)
++  }
++})
++
++test('faxes are counted on their own, with failures', () => {
++  const log = [
++    ...many(5, { kind: 'fax', result: 'Sent' }),
++    ...many(2, { kind: 'fax', result: 'Fax Not Sent' }),
++    ...many(3, { kind: 'fax', direction: 'Inbound', result: 'Received' }),
++    call({ kind: 'fax', direction: 'Inbound', result: 'Receive Error' }),
++    ...many(4),
++  ]
++  const { voice, fax } = splitByKind(log)
++  assert.equal(voice.length, 4)
++  assert.deepEqual(faxKpis(fax), { total: 11, sent: 7, received: 4, failed: 3 })
++})
++
++// ---- Call KPIs ---------------------------------------------------------------
++
++test('inbound answered and outbound connected are separate rates, over voice calls only', () => {
++  // The shape of the live account this was built against: a busy outbound team, few inbound calls, and a fax line.
++  const log = [
++    ...many(2767, { result: 'Call connected', durationSeconds: 600 }),
++    ...many(18, { result: 'Hang Up' }),
++    ...many(6, { result: 'Wrong Number' }),
++    ...many(2, { result: 'No Answer' }),
++    ...many(4, { direction: 'Inbound', result: 'Accepted', durationSeconds: 300 }),
++    ...many(44, { direction: 'Inbound', result: 'Missed', extensionName: 'Unassigned', extensionType: '' }),
++    ...many(36, { direction: 'Inbound', result: 'Voicemail', extensionName: 'Unassigned', extensionType: '', durationSeconds: 40 }),
++    ...many(4, { direction: 'Inbound', result: 'Blocked' }),
++    call({ direction: 'Inbound', result: 'Rejected' }),
++    ...many(964, { kind: 'fax', result: 'Sent', durationSeconds: 60 }),
++    ...many(965, { kind: 'fax', direction: 'Inbound', result: 'Received', durationSeconds: 60 }),
++  ]
++  const k = callKpis(splitByKind(log).voice)
++  assert.equal(k.total, 2882)
++  assert.equal(k.inbound, 89)
++  assert.equal(k.outbound, 2793)
++  assert.equal(k.inboundAnswered, 4)
++  assert.equal(k.outboundConnected, 2767)
++  assert.equal(k.connected, 2771)
++  assert.equal(k.missed, 44)
++  assert.equal(k.voicemail, 36)
++  assert.equal(Math.round(k.inboundAnswerRate * 10) / 10, 4.5)
++  assert.equal(Math.round(k.outboundConnectRate * 10) / 10, 99.1)
++  // Average length of answered calls; voicemails and faxes don't drag it.
++  assert.equal(Math.round(k.avgDuration), Math.round((2767 * 600 + 4 * 300) / 2771))
++})
++
++test('no calls means no rates, not a divide-by-zero', () => {
++  const k = callKpis([])
++  assert.equal(k.inboundAnswerRate, 0)
++  assert.equal(k.outboundConnectRate, 0)
++  assert.equal(k.avgDuration, 0)
++})
++
++test('the "connected" caller list includes answered inbound calls', () => {
++  const log = [call(), call({ direction: 'Inbound', result: 'Accepted' }), call({ direction: 'Inbound', result: 'Missed' })]
++  assert.equal(callsForMetric(log, 'connected').length, 2)
++  assert.equal(callsForMetric(log, 'missed').length, 1)
++})
++
++// ---- SMS ---------------------------------------------------------------------
++
++test('SMS delivery rate is measured on messages sent, not on messages received', () => {
++  const sms = [
++    ...Array.from({ length: 47 }, () => ({ direction: 'Outbound', status: 'Delivered' })),
++    ...Array.from({ length: 30 }, () => ({ direction: 'Inbound', status: 'Received' })),
++  ]
++  const k = smsKpis(sms)
++  assert.equal(k.deliveryRate, 100)
++  assert.deepEqual([k.total, k.inbound, k.outbound, k.delivered, k.failed], [77, 30, 47, 47, 0])
++
++  const withFailures = smsKpis([...sms, { direction: 'Outbound', status: 'DeliveryFailed' }, { direction: 'Outbound', status: 'SendingFailed' }, { direction: 'Outbound', status: 'Queued' }])
++  assert.equal(withFailures.failed, 2)
++  assert.equal(withFailures.deliveryRate, (47 / 50) * 100)
++  assert.equal(smsKpis([{ direction: 'Inbound', status: 'Received' }]).deliveryRate, 0)
++})
++
++// ---- Time zone ---------------------------------------------------------------
++
++test('a moment is placed on the calendar and clock of the chosen zone', () => {
++  const t = new Date('2026-09-15T03:30:00Z') // Monday evening in the US, Tuesday in Australia
++  assert.deepEqual(zonedParts(t, 'America/Los_Angeles'), { year: 2026, month: 9, day: 14, hour: 20, minute: 30, second: 0, weekday: 1 })
++  assert.equal(zonedDateKey(t, 'America/Los_Angeles'), '2026-09-14')
++  assert.equal(zonedDateKey(t, 'Australia/Melbourne'), '2026-09-15')
++  assert.equal(zonedDateKey(t, 'UTC'), '2026-09-15')
++  assert.equal(zonedParts(new Date('2026-09-15T07:00:00Z'), 'America/Los_Angeles').hour, 0, 'midnight is hour 0, not 24')
++})
++
++test('day and month boundaries follow the zone, including across daylight-saving changes', () => {
++  assert.equal(zonedMidnight(2026, 9, 15, 'America/New_York').toISOString(), '2026-09-15T04:00:00.000Z')
++  assert.equal(zonedMidnight(2026, 9, 31, 'America/New_York').toISOString(), '2026-10-01T04:00:00.000Z', 'day overflow rolls into the next month')
++  // US clocks go back on 1 Nov 2026 and forward on 8 Mar 2026.
++  assert.equal(zonedMidnight(2026, 11, 1, 'America/New_York').toISOString(), '2026-11-01T04:00:00.000Z')
++  assert.equal(zonedMidnight(2026, 11, 2, 'America/New_York').toISOString(), '2026-11-02T05:00:00.000Z')
++  assert.equal(zonedMidnight(2026, 3, 8, 'America/New_York').toISOString(), '2026-03-08T05:00:00.000Z')
++  assert.equal(zonedMidnight(2026, 3, 9, 'America/New_York').toISOString(), '2026-03-09T04:00:00.000Z')
++  // Melbourne moves forward on 4 Oct 2026.
++  assert.equal(zonedMidnight(2026, 10, 4, 'Australia/Melbourne').toISOString(), '2026-10-03T14:00:00.000Z')
++  assert.equal(zonedMidnight(2026, 10, 5, 'Australia/Melbourne').toISOString(), '2026-10-04T13:00:00.000Z')
++
++  const t = new Date('2026-10-06T15:06:00Z')
++  assert.equal(zonedDayStart(t, 'America/New_York').toISOString(), '2026-10-06T04:00:00.000Z')
++  assert.equal(zonedDayStart(t, 'America/New_York', -29).toISOString(), '2026-09-07T04:00:00.000Z')
++  assert.equal(zonedDayEnd(t, 'America/New_York').toISOString(), '2026-10-07T03:59:59.999Z')
++  assert.equal(zonedMonthStart(t, 'America/New_York').toISOString(), '2026-10-01T04:00:00.000Z')
++})
++
++test('zone names are validated before use', () => {
++  assert.ok(isValidTimeZone('America/Los_Angeles'))
++  assert.ok(isValidTimeZone('US/Pacific'), 'RingCentral sometimes reports the older alias')
++  assert.ok(!isValidTimeZone('Mars/Olympus'))
++  assert.ok(!isValidTimeZone(''))
++  assert.ok(!isValidTimeZone(null))
++})
++
++test('daily volume buckets a late-evening call on the team’s day', () => {
++  const calls = [
++    call({ startTime: new Date('2026-09-15T01:30:00Z') }), // Mon 14 Sep, 9:30pm in New York
++    call({ startTime: new Date('2026-09-15T14:00:00Z'), direction: 'Inbound' }),
++  ]
++  assert.deepEqual(dailyCallVolume(calls, 'America/New_York'), [
++    { date: '2026-09-14', inbound: 0, outbound: 1, total: 1 },
++    { date: '2026-09-15', inbound: 1, outbound: 0, total: 1 },
++  ])
++  assert.deepEqual(dailyCallVolume(calls, 'UTC').map((d) => d.date), ['2026-09-15'])
++})
++
++test('day keys are labelled as the day they name, wherever the page is opened', () => {
++  assert.equal(formatDayKey('2026-09-06'), 'Sep 6')
++  assert.equal(formatDayKey('not-a-date'), 'not-a-date')
++})
++
++test('the heatmap follows the hours calls actually happen in the chosen zone', () => {
++  // A 13:00–21:59 UTC working day is 9am–5pm in New York: all of it must be on the grid.
++  const calls = []
++  for (let hour = 13; hour <= 21; hour++) calls.push(...many(40, { startTime: new Date(Date.UTC(2026, 8, 15, hour, 15)) }))
++  calls.push(call({ startTime: new Date('2026-09-15T07:00:00Z') })) // one stray at 3am New York
++
++  const ny = callHeatmap(calls, 'America/New_York')
++  assert.deepEqual(ny.hours, [9, 10, 11, 12, 13, 14, 15, 16, 17])
++  assert.equal(ny.outside, 1)
++  assert.equal(ny.rows.find((r) => r.day === 'Tue' && r.hour === 9).count, 40)
++  assert.equal(ny.rows.reduce((sum, r) => sum + r.count, 0), 360)
++
++  // The same calls on a Pacific clock run 6am–2pm; the grid widens to show them instead of cutting them off.
++  const la = callHeatmap(calls, 'America/Los_Angeles')
++  assert.deepEqual([la.hours[0], la.hours.at(-1)], [6, 17])
++  assert.equal(la.outside, 1)
++  assert.equal(la.rows.find((r) => r.day === 'Tue' && r.hour === 6).count, 40)
++})
++
++// ---- Comparison period -------------------------------------------------------
++
++test('the prior period is the same length and ends the instant before the range starts', () => {
++  const range = { start: new Date('2026-09-07T04:00:00.000Z'), end: new Date('2026-10-07T03:59:59.999Z') } // 30 whole New York days
++  const prior = priorRange(range)
++  assert.equal(prior.end.toISOString(), '2026-09-07T03:59:59.999Z')
++  assert.equal(prior.start.toISOString(), '2026-08-08T04:00:00.000Z')
++  assert.equal(prior.end.getTime() - prior.start.getTime(), range.end.getTime() - range.start.getTime())
++
++  // A call on the last day before the range belongs to the prior period, and to nothing else.
++  const dayBefore = [call({ startTime: new Date('2026-09-06T18:00:00Z') })]
++  assert.equal(filterByRange(dayBefore, (c) => c.startTime, prior).length, 1)
++  assert.equal(filterByRange(dayBefore, (c) => c.startTime, range).length, 0)
++})
++
++// ---- Departments -------------------------------------------------------------
++
++test('a department comes from Settings first, then RingCentral’s directory', () => {
++  assert.equal(departmentFor({ 104: 'Intake' }, '104', 'Claims'), 'Intake')
++  assert.equal(departmentFor({}, '104', 'Claims'), 'Claims')
++  assert.equal(departmentFor({ 104: '  ' }, '104', ''), 'Unassigned')
++  assert.equal(departmentFor({}, '104'), 'Unassigned')
++})
++
++test('with no departments set up, volume is ranked by team member instead of one "Unassigned" bar', () => {
++  const calls = [...many(3, { extensionName: 'Pat' }), ...many(5, { extensionName: 'Lee' }), call({ extensionName: '' })]
++  assert.ok(!hasDepartments(calls))
++  assert.deepEqual(volumeByGroup(calls), {
++    by: 'member',
++    rows: [
++      { name: 'Lee', value: 5 },
++      { name: 'Pat', value: 3 },
++      { name: 'Unassigned', value: 1 },
++    ],
++  })
++
++  const mapped = [...many(3, { department: 'Intake' }), ...many(2, { department: 'Claims' }), call()]
++  assert.ok(hasDepartments(mapped))
++  assert.deepEqual(volumeByGroup(mapped).rows, [
++    { name: 'Intake', value: 3 },
++    { name: 'Claims', value: 2 },
++    { name: 'Unassigned', value: 1 },
++  ])
++})
+diff --git a/test/worker.test.mjs b/test/worker.test.mjs
+index 12a2c69..54bdb0f 100644
+--- a/test/worker.test.mjs
++++ b/test/worker.test.mjs
+@@ -26,7 +26,8 @@ beforeEach(() => {
+   calls = []
+   routes = {
+     'POST /restapi/oauth/token': () => reply({ access_token: 'tok-1', expires_in: 3600 }),
+-    'GET /restapi/v1.0/account/~/extension/~': () => reply({ name: 'Ada Admin', extensionNumber: '101', permissions: { admin: { enabled: true } } }),
++    'GET /restapi/v1.0/account/~/extension/~': () =>
++      reply({ name: 'Ada Admin', extensionNumber: '101', permissions: { admin: { enabled: true } }, regionalSettings: { timezone: { id: '58', name: 'America/Los_Angeles' } } }),
+   }
+   globalThis.fetch = async (input, init = {}) => {
+     const url = new URL(typeof input === 'string' ? input : input.url ?? input)
+@@ -87,7 +88,12 @@ test('status signs in with the JWT and never exposes credentials or the token',
+   const res = await api('/api/status')
+   assert.equal(res.status, 200)
+   const text = await res.text()
+-  assert.deepEqual(JSON.parse(text), { ok: true, user: { name: 'Ada Admin', extensionNumber: '101', isAdmin: true }, environment: 'production' })
++  assert.deepEqual(JSON.parse(text), {
++    ok: true,
++    user: { name: 'Ada Admin', extensionNumber: '101', isAdmin: true },
++    environment: 'production',
++    timeZone: 'America/Los_Angeles',
++  })
+ 
+   const tokenCall = calls.find((c) => c.key === 'POST /restapi/oauth/token')
+   assert.equal(tokenCall.init.headers.Authorization, `Basic ${btoa('cid:csecret')}`)
+@@ -170,6 +176,8 @@ test('calls: one page, mapped, with paging and the requested window', async () =
+         extension: '101',
+         extensionName: 'Ada Admin',
+         extensionType: '',
++        extensionDepartment: '',
++        type: 'Voice',
+         durationSeconds: 65,
+         result: 'Call connected',
+         recorded: true,
+@@ -261,6 +269,100 @@ test('calls: the extension list is fetched once per isolate, and a failure there
+   assert.equal(limited.headers.get('Retry-After'), '7')
+ })
+ 
++test('status: a missing time zone is reported as empty rather than guessed', async () => {
++  routes['GET /restapi/v1.0/account/~/extension/~'] = () => reply({ name: 'Ada Admin', extensionNumber: '101' })
++  assert.equal((await (await api('/api/status')).json()).timeZone, '')
++})
++
++test('calls: faxes are marked so the dashboard can keep them out of call metrics', async () => {
++  routes['GET /restapi/v1.0/account/~/extension'] = () => reply(DIRECTORY)
++  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
++    reply({
++      records: [
++        { id: 'f1', type: 'Fax', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550100' }, extension: { id: 11 }, result: 'Sent' },
++        { id: 'v1', type: 'Voice', startTime: '2026-09-02T02:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550101' }, extension: { id: 11 }, result: 'Call connected' },
++        { id: 'v2', startTime: '2026-09-02T03:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550102' }, extension: { id: 11 }, result: 'Call connected' },
++      ],
++    })
++  const body = await (await api(`/api/calls?${WINDOW}`)).json()
++  assert.deepEqual(body.records.map((r) => [r.callId, r.type]), [['f1', 'Fax'], ['v1', 'Voice'], ['v2', 'Voice']])
++})
++
++test('calls: an inbound call nobody picked up is credited to the line that was dialled', async () => {
++  routes['GET /restapi/v1.0/account/~/extension'] = () =>
++    reply({ records: [...DIRECTORY.records, { id: 14, type: 'User', name: 'Cy Advocate', extensionNumber: '103', contact: { department: 'Claims' } }] })
++  routes['GET /restapi/v1.0/account/~/phone-number'] = () =>
++    reply({
++      records: [
++        { phoneNumber: '+18005550100', usageType: 'MainCompanyNumber' },
++        { phoneNumber: '+17025550114', usageType: 'DirectNumber', extension: { id: 14, extensionNumber: '103' } },
++        { phoneNumber: '+17025550199', usageType: 'CompanyFaxNumber', label: 'Records fax' },
++      ],
++    })
++  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
++    reply({
++      records: [
++        // Missed on a person's direct number: theirs, even though the record names no extension.
++        { id: 'm1', startTime: '2026-09-02T01:00:00Z', direction: 'Inbound', from: { name: 'NEVADA', phoneNumber: '+17025550001' }, to: { phoneNumber: '+17025550114' }, result: 'Missed' },
++        // Missed on the main number: a company line, not a person.
++        { id: 'm2', startTime: '2026-09-02T02:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550002' }, to: { phoneNumber: '+18005550100' }, result: 'Voicemail' },
++        // A labelled company number keeps its label.
++        { id: 'f1', type: 'Fax', startTime: '2026-09-02T03:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550003' }, to: { phoneNumber: '+17025550199' }, result: 'Received' },
++        // Rang the direct number but a colleague answered: the person who answered keeps the call.
++        {
++          id: 'a1',
++          startTime: '2026-09-02T04:00:00Z',
++          direction: 'Inbound',
++          from: { phoneNumber: '+17025550004' },
++          to: { phoneNumber: '+17025550114' },
++          result: 'Accepted',
++          legs: [{ extension: { id: 13 }, result: 'Accepted' }],
++        },
++        // The outside number on an outbound call is never looked up as one of ours.
++        { id: 'o1', startTime: '2026-09-02T05:00:00Z', direction: 'Outbound', from: { name: 'Somebody' }, to: { phoneNumber: '+17025550114' }, result: 'Call connected' },
++        // A number the account doesn't list stays unowned.
++        { id: 'm3', startTime: '2026-09-02T06:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550005' }, to: { phoneNumber: '+19995550000' }, result: 'Missed' },
++      ],
++    })
++  const body = await (await api(`/api/calls?${WINDOW}`)).json()
++  assert.deepEqual(
++    body.records.map((r) => [r.callId, r.extensionName, r.extension, r.extensionType, r.extensionDepartment]),
++    [
++      ['m1', 'Cy Advocate', '103', 'User', 'Claims'],
++      ['m2', 'Main number +18005550100', '', 'CompanyNumber', ''],
++      ['f1', 'Records fax +17025550199', '', 'CompanyNumber', ''],
++      ['a1', 'Ben Agent', '102', 'User', ''],
++      ['o1', 'Somebody', '', '', ''],
++      ['m3', 'Unassigned', '', '', ''],
++    ],
++  )
++
++  // Loaded with the extension list: once per isolate, not once per page.
++  await api(`/api/calls?${WINDOW}&page=2`)
++  assert.equal(calls.filter((c) => c.key === 'GET /restapi/v1.0/account/~/phone-number').length, 1)
++})
++
++test('calls: an account that refuses the phone-number list still gets names from the extension list', async () => {
++  routes['GET /restapi/v1.0/account/~/extension'] = () => reply(DIRECTORY)
++  routes['GET /restapi/v1.0/account/~/phone-number'] = () => reply({ errorCode: 'CMN-408', message: 'needs [ReadCompanyPhoneNumbers]' }, 403)
++  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
++    reply({
++      records: [
++        { id: 'o1', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550100' }, extension: { id: 11 } },
++        { id: 'm1', startTime: '2026-09-02T02:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550001' }, to: { phoneNumber: '+18005550100' }, result: 'Missed' },
++      ],
++    })
++  const res = await api(`/api/calls?${WINDOW}`)
++  assert.equal(res.status, 200)
++  const body = await res.json()
++  assert.equal(body.scope, 'company', 'a refused phone-number list must not be mistaken for a non-admin user')
++  assert.deepEqual(body.records.map((r) => r.extensionName), ['Ada Admin', 'Unassigned'])
++
++  // Not asked again on the next page: the list is as rate-limited as the call log itself.
++  await api(`/api/calls?${WINDOW}&page=2`)
++  assert.equal(calls.filter((c) => c.key === 'GET /restapi/v1.0/account/~/phone-number').length, 1)
++})
++
+ test('calls: a non-admin JWT falls back to that user’s own call log', async () => {
+   routes['GET /restapi/v1.0/account/~/call-log'] = () => reply({ errorCode: 'CMN-408', message: 'In order to call this API endpoint, user needs to have [ReadCompanyCallLog] permission' }, 403)
+   routes['GET /restapi/v1.0/account/~/extension/~/call-log'] = () => reply({ records: [{ id: 'c9', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound' }] })
+@@ -285,8 +387,13 @@ test('bad parameters are rejected without calling RingCentral for data', async (
+ 
+ test('extensions: only user extensions are listed', async () => {
+   routes['GET /restapi/v1.0/account/~/extension'] = () =>
+-    reply({ records: [{ id: 11, type: 'User', name: 'Ada', extensionNumber: '101' }, { id: 12, type: 'Department', name: 'Sales queue', extensionNumber: '200' }] })
+-  assert.deepEqual(await (await api('/api/extensions')).json(), { extensions: [{ id: '11', name: 'Ada', extensionNumber: '101' }], scope: 'company' })
++    reply({
++      records: [
++        { id: 11, type: 'User', name: 'Ada', extensionNumber: '101', contact: { department: 'Intake' } },
++        { id: 12, type: 'Department', name: 'Sales queue', extensionNumber: '200' },
++      ],
++    })
++  assert.deepEqual(await (await api('/api/extensions')).json(), { extensions: [{ id: '11', name: 'Ada', extensionNumber: '101', department: 'Intake' }], scope: 'company' })
+ })
+ 
+ test('sms: message text is never passed to the browser', async () => {
+diff --git a/worker/index.ts b/worker/index.ts
+index 0a3a806..18a378c 100644
+--- a/worker/index.ts
++++ b/worker/index.ts
+@@ -2,19 +2,21 @@
+ // JSON API under /api/ that signs in to RingCentral server-side with the JWT app
+ // credentials held in Worker secrets. The browser never gets those credentials.
+ //
+-//   GET /api/status                               who the Worker is signed in as
++//   GET /api/status                               who the Worker is signed in as, and the account's time zone
+ //   GET /api/calls?from&to&page[&scope]           one page of the call log
+ //   GET /api/extensions                           user extensions (for the SMS import)
+ //   GET /api/sms?from&to&extensionId&page         one page of one user's SMS log
+ //   GET /api/qos?from&to&page                     queue service quality per day (Business Analytics API)
+ 
+ import { ApiError, RcSession, isForbidden, type Env, type RcRecord } from './ringcentral.ts'
+-import { mapCall, mapDirectory, mapExtension, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
++import { emptyDirectory, mapCall, mapDirectory, mapExtension, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
+ 
+ const CALL_PAGE_SIZE = '1000'
+ const SMS_PAGE_SIZE = '1000'
+ const EXTENSION_PAGE_SIZE = '1000'
+ const MAX_EXTENSION_PAGES = 10
++const PHONE_NUMBER_PAGE_SIZE = '1000'
++const MAX_PHONE_NUMBER_PAGES = 5
+ /** The timeline endpoint returns at most 20 groups (queues) per page. */
+ const QOS_PAGE_SIZE = '20'
+ /** Business Analytics keeps roughly the last 184 days. */
+@@ -110,6 +112,8 @@ async function status(rc: RcSession) {
+       isAdmin: Boolean(me.permissions?.admin?.enabled),
+     },
+     environment: rc.creds.serverUrl.includes('devtest') ? 'sandbox' : 'production',
++    // The IANA zone set in RingCentral for this user, e.g. "America/Los_Angeles"; the dashboard buckets days and hours in it.
++    timeZone: typeof me.regionalSettings?.timezone?.name === 'string' ? me.regionalSettings.timezone.name : '',
+   }
+ }
+ 
+@@ -124,26 +128,51 @@ async function listExtensions(rc: RcSession, filter: Record<string, string> = {}
+   return all
+ }
+ 
++async function listPhoneNumbers(rc: RcSession): Promise<RcRecord[]> {
++  const all: RcRecord[] = []
++  for (let page = 1; page <= MAX_PHONE_NUMBER_PAGES; page++) {
++    const data = await rc.call('/restapi/v1.0/account/~/phone-number', { params: { perPage: PHONE_NUMBER_PAGE_SIZE, page: String(page) } })
++    const records: RcRecord[] = data.records ?? []
++    all.push(...records)
++    if (records.length === 0 || !data.navigation?.nextPage) break
++  }
++  return all
++}
++
+ // ---- Extension directory ---------------------------------------------------------
+ // A call log record names its owner only by extension id, so the calls route resolves
+ // ids against the account's extension list. Every status is included: a team member who
+-// has since been disabled still owns their past calls.
++// has since been disabled still owns their past calls. The account's phone numbers are
++// loaded alongside, so an inbound call that never reached anyone is still credited to
++// the line that was dialled.
+ 
+ let directoryMemo: { account: string; expiresAt: number; directory: Directory } | null = null
+ 
++const isRateLimited = (e: unknown) => e instanceof ApiError && e.code === 'rate_limited'
++
+ async function loadDirectory(rc: RcSession): Promise<Directory> {
+   const account = `${rc.creds.serverUrl}|${rc.creds.clientId}`
+   if (directoryMemo && directoryMemo.account === account && Date.now() < directoryMemo.expiresAt) return directoryMemo.directory
+   let directory: Directory
+   let ttl = DIRECTORY_TTL_MS
+   try {
+-    directory = mapDirectory(await listExtensions(rc))
++    const extensionList = await listExtensions(rc)
++    let phoneNumbers: RcRecord[] = []
++    try {
++      phoneNumbers = await listPhoneNumbers(rc)
++    } catch (e) {
++      if (isRateLimited(e)) throw e
++      // Not retried sooner than the extension list: this is a rate-limit-heavy call, and without it
++      // the only loss is that unanswered inbound calls stay unattributed.
++      console.warn('Phone-number list unavailable; unanswered inbound calls are not matched to a line.', e instanceof Error ? e.message : e)
++    }
++    directory = mapDirectory(extensionList, phoneNumbers)
+   } catch (e) {
+     // Rate limits are passed on so the browser waits and retries with names intact.
+     // Anything else: carry on without the list rather than failing the call log.
+-    if (e instanceof ApiError && e.code === 'rate_limited') throw e
++    if (isRateLimited(e)) throw e
+     console.warn('Extension list unavailable; call owners fall back to the names on each record.', e instanceof Error ? e.message : e)
+-    directory = new Map()
++    directory = emptyDirectory()
+     ttl = DIRECTORY_RETRY_MS
+   }
+   directoryMemo = { account, expiresAt: Date.now() + ttl, directory }
+@@ -164,7 +193,7 @@ async function calls(rc: RcSession, url: URL) {
+     try {
+       const data = await rc.call('/restapi/v1.0/account/~/call-log', { params })
+       const records: RcRecord[] = data.records ?? []
+-      const directory = records.length > 0 ? await loadDirectory(rc) : new Map()
++      const directory = records.length > 0 ? await loadDirectory(rc) : emptyDirectory()
+       return { records: records.map((r) => mapCall(r, directory)), hasMore: hasMore(data, records.length), scope: 'company' }
+     } catch (e) {
+       if (!isForbidden(e)) throw e
+diff --git a/worker/mappers.ts b/worker/mappers.ts
+index 6fa34e9..3570e80 100644
+--- a/worker/mappers.ts
++++ b/worker/mappers.ts
+@@ -17,21 +17,36 @@ export interface WireCall {
+   extensionName: string
+   /** RingCentral extension type of that owner ("User", "Department", …); "" when it couldn't be looked up. */
+   extensionType: string
++  /** The owner's department in the RingCentral directory; "" when none is set there. */
++  extensionDepartment: string
++  /** RingCentral logs faxes in the call log too; the dashboard keeps them out of call metrics. */
++  type: 'Voice' | 'Fax'
+   durationSeconds: number
+   result: string
+   recorded: boolean
+ }
+ 
+-/** One entry of the account's extension list, keyed by extension id in a `Directory`. */
++/** Who a call can belong to: an extension from the account's list, or a company number no extension owns. */
+ export interface DirectoryEntry {
+   name: string
+   extensionNumber: string
++  /** RingCentral extension type; "CompanyNumber" for a number that belongs to the account itself. */
+   type: string
++  department: string
+ }
+ 
+-export type Directory = Map<string, DirectoryEntry>
++export interface Directory {
++  /** Extensions by extension id. */
++  extensions: Map<string, DirectoryEntry>
++  /** The account's own phone numbers (digits only) and who each one rings. */
++  numbers: Map<string, DirectoryEntry>
++}
++
++export const emptyDirectory = (): Directory => ({ extensions: new Map(), numbers: new Map() })
++
++const NO_DIRECTORY: Directory = emptyDirectory()
+ 
+-const NO_DIRECTORY: Directory = new Map()
++const digitsOf = (phoneNumber: unknown): string => String(phoneNumber ?? '').replace(/\D/g, '')
+ 
+ export interface WireSms {
+   messageId: string
+@@ -46,6 +61,7 @@ export interface WireExtension {
+   id: string
+   name: string
+   extensionNumber: string
++  department: string
+ }
+ 
+ export interface WireQos {
+@@ -70,7 +86,7 @@ const ANSWERED_RESULTS = new Set(['Accepted', 'Call connected'])
+  */
+ function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecord): DirectoryEntry {
+   const ourSide: RcRecord | undefined = record.direction === 'Outbound' ? record.from : record.to
+-  const lookup = (id: unknown) => (id === undefined || id === null ? undefined : directory.get(String(id)))
++  const lookup = (id: unknown) => (id === undefined || id === null ? undefined : directory.extensions.get(String(id)))
+ 
+   let owner = lookup(record.extension?.id) ?? lookup(ourSide?.extensionId)
+ 
+@@ -85,6 +101,13 @@ function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecor
+       }
+     }
+   }
++
++  // An inbound call nobody picked up often carries no extension at all. The number that
++  // was dialled still says whose line it was: a person's direct number, or a company line.
++  if (!owner && record.direction !== 'Outbound') {
++    const dialled = digitsOf(ourSide?.phoneNumber)
++    if (dialled) owner = directory.numbers.get(dialled)
++  }
+   if (owner) return owner
+ 
+   const inline: RcRecord | undefined = record.extension?.name || record.extension?.extensionNumber ? record.extension : fallbackExt
+@@ -92,6 +115,7 @@ function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecor
+     name: inline?.name ?? ourSide?.name ?? 'Unassigned',
+     extensionNumber: inline?.extensionNumber ?? ourSide?.extensionNumber ?? '',
+     type: inline?.type ?? '',
++    department: inline?.contact?.department ?? '',
+   }
+ }
+ 
+@@ -108,17 +132,50 @@ export function mapCall(record: RcRecord, directory: Directory = NO_DIRECTORY, f
+     extension: owner.extensionNumber,
+     extensionName: owner.name || 'Unassigned',
+     extensionType: owner.type,
++    extensionDepartment: owner.department,
++    type: record.type === 'Fax' ? 'Fax' : 'Voice',
+     durationSeconds: record.duration ?? 0,
+     result: record.result ?? 'Unknown',
+     recorded: Boolean(record.recording),
+   }
+ }
+ 
+-export function mapDirectory(records: RcRecord[]): Directory {
+-  const directory: Directory = new Map()
+-  for (const r of records) {
++const USAGE_LABELS: Record<string, string> = {
++  MainCompanyNumber: 'Main number',
++  AdditionalCompanyNumber: 'Company line',
++  CompanyNumber: 'Company line',
++  CompanyFaxNumber: 'Fax line',
++}
++
++/**
++ * @param extensions    the account's extension list
++ * @param phoneNumbers  the account's phone-number list; each number names the extension it rings, if any
++ */
++export function mapDirectory(extensions: RcRecord[], phoneNumbers: RcRecord[] = []): Directory {
++  const directory = emptyDirectory()
++  for (const r of extensions) {
+     if (r.id === undefined || r.id === null) continue
+-    directory.set(String(r.id), { name: r.name ?? '', extensionNumber: r.extensionNumber ?? '', type: r.type ?? '' })
++    directory.extensions.set(String(r.id), {
++      name: r.name ?? '',
++      extensionNumber: r.extensionNumber ?? '',
++      type: r.type ?? '',
++      department: r.contact?.department ?? '',
++    })
++  }
++  for (const n of phoneNumbers) {
++    const digits = digitsOf(n.phoneNumber)
++    if (!digits) continue
++    const owner = n.extension?.id === undefined || n.extension?.id === null ? undefined : directory.extensions.get(String(n.extension.id))
++    directory.numbers.set(
++      digits,
++      owner ?? {
++        // A number that rings no single extension (main line, company fax): a shared line, not a person.
++        name: `${String(n.label ?? '').trim() || USAGE_LABELS[n.usageType] || 'Company line'} ${n.phoneNumber}`,
++        extensionNumber: '',
++        type: 'CompanyNumber',
++        department: '',
++      },
++    )
+   }
+   return directory
+ }
+@@ -135,7 +192,7 @@ export function mapSms(record: RcRecord): WireSms {
+ }
+ 
+ export function mapExtension(record: RcRecord): WireExtension {
+-  return { id: String(record.id), name: record.name ?? 'Unassigned', extensionNumber: record.extensionNumber ?? '' }
++  return { id: String(record.id), name: record.name ?? 'Unassigned', extensionNumber: record.extensionNumber ?? '', department: record.contact?.department ?? '' }
+ }
+ 
+ // ---- Business Analytics (timeline, grouped by queue, one point per day) ------
+-- 
+2.43.0
+
