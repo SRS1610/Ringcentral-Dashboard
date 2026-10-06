@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { ChartCard } from '../components/ui/ChartCard'
 import { StatusBadge } from '../components/ui/Badge'
 import { useRingCentral } from '../state/RingCentralContext'
+import { useData } from '../state/DataContext'
+import { browserTimeZone, listTimeZones, timeZoneAbbreviation } from '../lib/timezone'
 
 const inputStyle = { border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--text-primary)' }
 const secondaryButtonStyle = { border: '1px solid var(--border)', color: 'var(--text-secondary)' }
@@ -98,6 +100,7 @@ function ConnectedCard() {
           {rc.hasPassword && rc.remembered && <span>The dashboard password is remembered on this browser. "Lock this browser" removes it.</span>}
           {rc.smsSkipped !== null && rc.smsSkipped > 0 && <span>{rc.smsSkipped} user(s) skipped for SMS — likely a permissions/scope issue on that mailbox.</span>}
           {rc.qosNote && <span>{rc.qosNote}</span>}
+          {rc.compareNote && <span>{rc.compareNote}</span>}
         </div>
 
         {rc.lastError && <ErrorBox message={rc.lastError} />}
@@ -150,7 +153,7 @@ function UnlockCard() {
         </button>
         <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
           This is the password set on the dashboard server, not your RingCentral password. Leave "Remember" unchecked on shared computers.
-          Once unlocked, the last {30} days of calls, SMS and service quality import automatically.
+          Once unlocked, the last {30} days of calls, SMS and service quality import automatically, followed by the 30 days before for comparison.
         </p>
       </form>
     </ChartCard>
@@ -235,6 +238,40 @@ function SetupGuide() {
   )
 }
 
+const ZONES = listTimeZones()
+
+function TimeZoneCard() {
+  const { timeZone, timeZoneChoice, setTimeZoneChoice, accountTimeZone } = useData()
+  const automatic = accountTimeZone ? `RingCentral account (${accountTimeZone})` : `this browser (${browserTimeZone()})`
+  // A saved zone the browser's list doesn't name (an alias such as "US/Pacific") still needs an option.
+  const options = timeZoneChoice && !ZONES.includes(timeZoneChoice) ? [timeZoneChoice, ...ZONES] : ZONES
+
+  return (
+    <ChartCard title="Time zone" subtitle="Days, hours and call times across the dashboard are counted on this clock">
+      <div className="flex flex-col gap-2">
+        <select
+          aria-label="Dashboard time zone"
+          value={timeZoneChoice ?? ''}
+          onChange={(e) => setTimeZoneChoice(e.target.value || null)}
+          className="rounded-md px-2 py-1.5 text-sm max-w-md"
+          style={inputStyle}
+        >
+          <option value="">Automatic: {automatic}</option>
+          {options.map((zone) => (
+            <option key={zone} value={zone}>
+              {zone}
+            </option>
+          ))}
+        </select>
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          Now using {timeZone} ({timeZoneAbbreviation(timeZone)}). Set it to where the team works, so a call at 9am there shows as 9am here wherever
+          the dashboard is opened. Saved on this browser.
+        </p>
+      </div>
+    </ChartCard>
+  )
+}
+
 function DepartmentMapEditor() {
   const rc = useRingCentral()
   const entries = Object.entries(rc.departmentMap)
@@ -255,11 +292,11 @@ function DepartmentMapEditor() {
   }
 
   return (
-    <ChartCard title="Department mapping" subtitle="RingCentral doesn't tag calls with a department, so map extension numbers to department names here">
+    <ChartCard title="Department mapping" subtitle="Departments come from each extension's Department field in RingCentral. Add or override them here by extension number; applies from the next import.">
       <div className="flex flex-col gap-2">
         {entries.length === 0 && (
           <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
-            No mappings yet — anything unmapped shows as "Unassigned".
+            No mappings yet. Extensions with no department in RingCentral and none here are grouped by team member instead.
           </p>
         )}
         {entries.map(([ext, dept]) => (
@@ -303,6 +340,7 @@ export function Settings() {
   return (
     <div className="flex flex-col gap-5">
       <ConnectionCard />
+      <TimeZoneCard />
       <DepartmentMapEditor />
       <SetupGuide />
 

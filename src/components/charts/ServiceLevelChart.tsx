@@ -1,5 +1,5 @@
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { formatShortDate } from '../../lib/format'
+import { formatDayKey } from '../../lib/format'
 import { makeTooltipFormatter } from './ChartTooltip'
 
 interface Point {
@@ -8,7 +8,7 @@ interface Point {
 }
 
 export function ServiceLevelChart({ data, target = 85, height = 260 }: { data: Point[]; target?: number; height?: number }) {
-  const tickFormatter = (v: string) => formatShortDate(new Date(v))
+  const tickFormatter = (v: string) => formatDayKey(v)
   const Tip = makeTooltipFormatter(tickFormatter, [
     { key: 'serviceLevel', label: 'Service level', color: 'var(--series-3)', format: (v) => `${v.toFixed(0)}%` },
   ])

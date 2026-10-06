@@ -25,7 +25,7 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 120)
 
 const CALL_HEADERS = [
   'Call ID', 'Start Time', 'Direction', 'From Name', 'From Number', 'To Name', 'To Number',
-  'Extension Number', 'Extension Name', 'Department', 'Duration (Seconds)', 'Result', 'Recorded',
+  'Extension Number', 'Extension Name', 'Department', 'Duration (Seconds)', 'Result', 'Recorded', 'Type',
 ]
 const SMS_HEADERS = ['Message ID', 'Date/Time', 'Direction', 'From', 'To', 'Extension Name', 'Department', 'Segments', 'Status']
 
@@ -86,6 +86,8 @@ function mapCallRecord(record, deptMap, directory) {
     'Duration (Seconds)': record.duration ?? 0,
     Result: record.result ?? 'Unknown',
     Recorded: record.recording ? 'Yes' : 'No',
+    // "Voice" or "Fax": the dashboard keeps faxes out of call metrics.
+    Type: record.type === 'Fax' ? 'Fax' : 'Voice',
   }
 }
 

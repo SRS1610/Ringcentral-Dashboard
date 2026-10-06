@@ -69,7 +69,7 @@ a scheduled CI job, so there's nothing extra to host.
    RingCentral sandbox account instead of production, also add a repository
    **variable** `RC_SERVER_URL` set to `https://platform.devtest.ringcentral.com`.
 4. Edit `scripts/department-map.json` to map your extension numbers to
-   department names — RingCentral's API doesn't expose department per call, so
+   department names — the scheduled sync doesn't read departments from RingCentral, so
    this mapping fills that gap. Anything not listed shows as "Unassigned".
 5. Run the **Sync RingCentral data** workflow once manually (Actions tab →
    select it → Run workflow) to do a first pull and confirm it works, then let
@@ -95,13 +95,13 @@ their browser and is never affected by this sync.
 
 ## Live data: the Cloudflare Worker (recommended)
 
-The dashboard runs on a Cloudflare Worker (`worker/`, config in `wrangler.jsonc`). The Worker serves the built site and a small JSON API under `/api/` that **signs in to RingCentral server-side** with a JWT app credential kept in Worker secrets. Viewers never handle RingCentral credentials: they enter one shared **dashboard password** in the Settings tab, and the last 30 days of calls, SMS and **service quality** import automatically. Picking dates on the calendar fetches exactly that window.
+The dashboard runs on a Cloudflare Worker (`worker/`, config in `wrangler.jsonc`). The Worker serves the built site and a small JSON API under `/api/` that **signs in to RingCentral server-side** with a JWT app credential kept in Worker secrets. Viewers never handle RingCentral credentials: they enter one shared **dashboard password** in the Settings tab, and the last 30 days of calls, SMS and **service quality** import automatically. Picking dates on the calendar fetches exactly that window. After either, the period just before it (same length, up to 92 days) loads in the background so the tiles can show "vs prior period".
 
 What the Worker fetches:
 
 | Tab | RingCentral API | Notes |
 |---|---|---|
-| Call Activity, Team Performance, Overview | Call Log API (`/account/~/call-log`) | Company-wide when the JWT's user is an admin; otherwise that user's own calls |
+| Call Activity, Team Performance, Overview | Call Log API (`/account/~/call-log`), plus the extension and phone-number lists | Company-wide when the JWT's user is an admin; otherwise that user's own calls |
 | Messaging | Message Store API, per user extension | Only numbers, time, direction and status reach the browser — never message text |
 | Service Quality | **Business Analytics API** (`/analytics/calls/v1/.../timeline/fetch`), grouped by call queue, one point per day | Service level = calls in SLA ÷ (in SLA + out of SLA), per the SLA target set on each queue in RingCentral. Speed of answer and handle time are averaged over answered calls (ring time; talk + hold). Analytics keeps about 184 days. |
 
@@ -122,9 +122,15 @@ Running it locally: `npm run dev:worker` builds the site and starts `wrangler de
 
 How the browser talks to it: every `/api/` request carries the dashboard password. The Worker exchanges the JWT for a RingCentral access token, keeps it in memory, and also hands the browser an encrypted copy (`X-RC-Session` header) that only the Worker's secrets can open, so a recycled Worker doesn't need a new token for every viewer — RingCentral allows only a few token requests per minute. The browser can't read that blob. The access token, the client secret and the JWT never leave the Worker; the API is read-only (GET) and returns only the fields the dashboard shows. `npm test` covers these routes against a fake RingCentral.
 
-**Who a call belongs to.** RingCentral's call log names a call's owner only by extension id, so the Worker looks the id up in the account's extension list (cached for ten minutes) to get the team member's name and extension number. A call to a queue or the main line is credited to the user who answered it, when a call leg shows one. The outside party — the caller on inbound calls, the number dialled on outbound — is never used as the owner; calls nobody on the account owns are listed as "Unassigned". The Team Performance leaderboard shows team members by default (switch to *All lines* for queues, shared lines and unassigned calls) with calls, inbound, outbound, connected, missed, voicemail, answer rate, average duration and talk time per person.
+**Who a call belongs to.** RingCentral's call log names a call's owner only by extension id, so the Worker looks the id up in the account's extension list (cached for ten minutes) to get the team member's name and extension number. A call to a queue or the main line is credited to the user who answered it, when a call leg shows one. An inbound call nobody picked up often carries no extension at all, so it is matched by the number that was dialled against the account's phone-number list: a direct number goes to its owner, a company number shows as a shared line ("Main number +1…"). The outside party — the caller on inbound calls, the number dialled on outbound — is never used as the owner; calls nobody on the account owns are listed as "Unassigned". The Team Performance leaderboard shows team members by default (switch to *All lines* for queues, shared lines and unassigned calls) with calls, inbound, outbound, connected, missed, voicemail, connect rate, average duration and talk time per person.
 
-**Callers behind a metric.** On Call Activity, click a tile (Total, Inbound, Outbound, Answer rate), a bar of the Call outcomes chart, or one of the chips above the *Callers* table to list the outside callers behind that number: caller-ID name, phone number, call count, total time, last call and the team members involved.
+**Calls vs faxes.** RingCentral keeps faxes in the same log as phone calls. The Worker passes on each record's type, and every call figure (totals, rates, trends, the leaderboard, the caller list) counts phone calls only; faxes get their own tile and *Fax activity* card. An uploaded export without a "Type" column is split by result ("Sent", "Received", "Fax Not Sent", …). Two rates replace a single answer rate: **Inbound answered** (inbound calls a person picked up ÷ all inbound calls) and **Outbound connected** (outbound calls that connected ÷ all outbound calls). SMS delivery rate is measured on messages sent.
+
+**Time zone.** Days, hours and displayed call times use one time zone: the one set in RingCentral for the JWT's user, unless a viewer picks another under *Settings → Time zone* (saved on that browser). Without live data it is the browser's own zone. Date presets and calendar picks cover whole days on that clock.
+
+**Departments.** A call's department is the Department field of its owner's extension in RingCentral; *Settings → Department mapping* adds or overrides one by extension number. When no extension has a department, the by-department charts rank team members and lines instead.
+
+**Callers behind a metric.** On Call Activity, click a tile (Total, Inbound, Outbound, Inbound answered, Outbound connected), a bar of the Call outcomes chart, or one of the chips above the *Callers* table to list the outside callers behind that number: caller-ID name, phone number, call count, total time, last call and the team members involved.
 
 Imported data lives in the viewer's browser tab. Uploads (the **Upload data** button) still work and override the live import for that dataset; **Clear uploads and imports** goes back to the site's data files. A static copy of the site (GitHub Pages or Netlify, below) has no `/api/`, so there the Settings tab shows "No dashboard server on this site" and only uploads and the scheduled sync's data files are available.
 

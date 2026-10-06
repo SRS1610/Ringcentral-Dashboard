@@ -26,7 +26,8 @@ beforeEach(() => {
   calls = []
   routes = {
     'POST /restapi/oauth/token': () => reply({ access_token: 'tok-1', expires_in: 3600 }),
-    'GET /restapi/v1.0/account/~/extension/~': () => reply({ name: 'Ada Admin', extensionNumber: '101', permissions: { admin: { enabled: true } } }),
+    'GET /restapi/v1.0/account/~/extension/~': () =>
+      reply({ name: 'Ada Admin', extensionNumber: '101', permissions: { admin: { enabled: true } }, regionalSettings: { timezone: { id: '58', name: 'America/Los_Angeles' } } }),
   }
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(typeof input === 'string' ? input : input.url ?? input)
@@ -87,7 +88,12 @@ test('status signs in with the JWT and never exposes credentials or the token', 
   const res = await api('/api/status')
   assert.equal(res.status, 200)
   const text = await res.text()
-  assert.deepEqual(JSON.parse(text), { ok: true, user: { name: 'Ada Admin', extensionNumber: '101', isAdmin: true }, environment: 'production' })
+  assert.deepEqual(JSON.parse(text), {
+    ok: true,
+    user: { name: 'Ada Admin', extensionNumber: '101', isAdmin: true },
+    environment: 'production',
+    timeZone: 'America/Los_Angeles',
+  })
 
   const tokenCall = calls.find((c) => c.key === 'POST /restapi/oauth/token')
   assert.equal(tokenCall.init.headers.Authorization, `Basic ${btoa('cid:csecret')}`)
@@ -170,6 +176,8 @@ test('calls: one page, mapped, with paging and the requested window', async () =
         extension: '101',
         extensionName: 'Ada Admin',
         extensionType: '',
+        extensionDepartment: '',
+        type: 'Voice',
         durationSeconds: 65,
         result: 'Call connected',
         recorded: true,
@@ -261,6 +269,100 @@ test('calls: the extension list is fetched once per isolate, and a failure there
   assert.equal(limited.headers.get('Retry-After'), '7')
 })
 
+test('status: a missing time zone is reported as empty rather than guessed', async () => {
+  routes['GET /restapi/v1.0/account/~/extension/~'] = () => reply({ name: 'Ada Admin', extensionNumber: '101' })
+  assert.equal((await (await api('/api/status')).json()).timeZone, '')
+})
+
+test('calls: faxes are marked so the dashboard can keep them out of call metrics', async () => {
+  routes['GET /restapi/v1.0/account/~/extension'] = () => reply(DIRECTORY)
+  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
+    reply({
+      records: [
+        { id: 'f1', type: 'Fax', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550100' }, extension: { id: 11 }, result: 'Sent' },
+        { id: 'v1', type: 'Voice', startTime: '2026-09-02T02:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550101' }, extension: { id: 11 }, result: 'Call connected' },
+        { id: 'v2', startTime: '2026-09-02T03:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550102' }, extension: { id: 11 }, result: 'Call connected' },
+      ],
+    })
+  const body = await (await api(`/api/calls?${WINDOW}`)).json()
+  assert.deepEqual(body.records.map((r) => [r.callId, r.type]), [['f1', 'Fax'], ['v1', 'Voice'], ['v2', 'Voice']])
+})
+
+test('calls: an inbound call nobody picked up is credited to the line that was dialled', async () => {
+  routes['GET /restapi/v1.0/account/~/extension'] = () =>
+    reply({ records: [...DIRECTORY.records, { id: 14, type: 'User', name: 'Cy Advocate', extensionNumber: '103', contact: { department: 'Claims' } }] })
+  routes['GET /restapi/v1.0/account/~/phone-number'] = () =>
+    reply({
+      records: [
+        { phoneNumber: '+18005550100', usageType: 'MainCompanyNumber' },
+        { phoneNumber: '+17025550114', usageType: 'DirectNumber', extension: { id: 14, extensionNumber: '103' } },
+        { phoneNumber: '+17025550199', usageType: 'CompanyFaxNumber', label: 'Records fax' },
+      ],
+    })
+  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
+    reply({
+      records: [
+        // Missed on a person's direct number: theirs, even though the record names no extension.
+        { id: 'm1', startTime: '2026-09-02T01:00:00Z', direction: 'Inbound', from: { name: 'NEVADA', phoneNumber: '+17025550001' }, to: { phoneNumber: '+17025550114' }, result: 'Missed' },
+        // Missed on the main number: a company line, not a person.
+        { id: 'm2', startTime: '2026-09-02T02:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550002' }, to: { phoneNumber: '+18005550100' }, result: 'Voicemail' },
+        // A labelled company number keeps its label.
+        { id: 'f1', type: 'Fax', startTime: '2026-09-02T03:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550003' }, to: { phoneNumber: '+17025550199' }, result: 'Received' },
+        // Rang the direct number but a colleague answered: the person who answered keeps the call.
+        {
+          id: 'a1',
+          startTime: '2026-09-02T04:00:00Z',
+          direction: 'Inbound',
+          from: { phoneNumber: '+17025550004' },
+          to: { phoneNumber: '+17025550114' },
+          result: 'Accepted',
+          legs: [{ extension: { id: 13 }, result: 'Accepted' }],
+        },
+        // The outside number on an outbound call is never looked up as one of ours.
+        { id: 'o1', startTime: '2026-09-02T05:00:00Z', direction: 'Outbound', from: { name: 'Somebody' }, to: { phoneNumber: '+17025550114' }, result: 'Call connected' },
+        // A number the account doesn't list stays unowned.
+        { id: 'm3', startTime: '2026-09-02T06:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550005' }, to: { phoneNumber: '+19995550000' }, result: 'Missed' },
+      ],
+    })
+  const body = await (await api(`/api/calls?${WINDOW}`)).json()
+  assert.deepEqual(
+    body.records.map((r) => [r.callId, r.extensionName, r.extension, r.extensionType, r.extensionDepartment]),
+    [
+      ['m1', 'Cy Advocate', '103', 'User', 'Claims'],
+      ['m2', 'Main number +18005550100', '', 'CompanyNumber', ''],
+      ['f1', 'Records fax +17025550199', '', 'CompanyNumber', ''],
+      ['a1', 'Ben Agent', '102', 'User', ''],
+      ['o1', 'Somebody', '', '', ''],
+      ['m3', 'Unassigned', '', '', ''],
+    ],
+  )
+
+  // Loaded with the extension list: once per isolate, not once per page.
+  await api(`/api/calls?${WINDOW}&page=2`)
+  assert.equal(calls.filter((c) => c.key === 'GET /restapi/v1.0/account/~/phone-number').length, 1)
+})
+
+test('calls: an account that refuses the phone-number list still gets names from the extension list', async () => {
+  routes['GET /restapi/v1.0/account/~/extension'] = () => reply(DIRECTORY)
+  routes['GET /restapi/v1.0/account/~/phone-number'] = () => reply({ errorCode: 'CMN-408', message: 'needs [ReadCompanyPhoneNumbers]' }, 403)
+  routes['GET /restapi/v1.0/account/~/call-log'] = () =>
+    reply({
+      records: [
+        { id: 'o1', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound', to: { phoneNumber: '+13125550100' }, extension: { id: 11 } },
+        { id: 'm1', startTime: '2026-09-02T02:00:00Z', direction: 'Inbound', from: { phoneNumber: '+17025550001' }, to: { phoneNumber: '+18005550100' }, result: 'Missed' },
+      ],
+    })
+  const res = await api(`/api/calls?${WINDOW}`)
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  assert.equal(body.scope, 'company', 'a refused phone-number list must not be mistaken for a non-admin user')
+  assert.deepEqual(body.records.map((r) => r.extensionName), ['Ada Admin', 'Unassigned'])
+
+  // Not asked again on the next page: the list is as rate-limited as the call log itself.
+  await api(`/api/calls?${WINDOW}&page=2`)
+  assert.equal(calls.filter((c) => c.key === 'GET /restapi/v1.0/account/~/phone-number').length, 1)
+})
+
 test('calls: a non-admin JWT falls back to that user’s own call log', async () => {
   routes['GET /restapi/v1.0/account/~/call-log'] = () => reply({ errorCode: 'CMN-408', message: 'In order to call this API endpoint, user needs to have [ReadCompanyCallLog] permission' }, 403)
   routes['GET /restapi/v1.0/account/~/extension/~/call-log'] = () => reply({ records: [{ id: 'c9', startTime: '2026-09-02T01:00:00Z', direction: 'Outbound' }] })
@@ -285,8 +387,13 @@ test('bad parameters are rejected without calling RingCentral for data', async (
 
 test('extensions: only user extensions are listed', async () => {
   routes['GET /restapi/v1.0/account/~/extension'] = () =>
-    reply({ records: [{ id: 11, type: 'User', name: 'Ada', extensionNumber: '101' }, { id: 12, type: 'Department', name: 'Sales queue', extensionNumber: '200' }] })
-  assert.deepEqual(await (await api('/api/extensions')).json(), { extensions: [{ id: '11', name: 'Ada', extensionNumber: '101' }], scope: 'company' })
+    reply({
+      records: [
+        { id: 11, type: 'User', name: 'Ada', extensionNumber: '101', contact: { department: 'Intake' } },
+        { id: 12, type: 'Department', name: 'Sales queue', extensionNumber: '200' },
+      ],
+    })
+  assert.deepEqual(await (await api('/api/extensions')).json(), { extensions: [{ id: '11', name: 'Ada', extensionNumber: '101', department: 'Intake' }], scope: 'company' })
 })
 
 test('sms: message text is never passed to the browser', async () => {

@@ -1,5 +1,5 @@
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { formatShortDate } from '../../lib/format'
+import { formatDayKey } from '../../lib/format'
 import { makeTooltipFormatter } from './ChartTooltip'
 
 interface Point {
@@ -9,7 +9,7 @@ interface Point {
 }
 
 export function VolumeAreaChart({ data, height = 260 }: { data: Point[]; height?: number }) {
-  const tickFormatter = (v: string) => formatShortDate(new Date(v))
+  const tickFormatter = (v: string) => formatDayKey(v)
   const Tip = makeTooltipFormatter(tickFormatter, [
     { key: 'inbound', label: 'Inbound', color: 'var(--series-1)', format: (v) => v.toLocaleString() },
     { key: 'outbound', label: 'Outbound', color: 'var(--series-2)', format: (v) => v.toLocaleString() },

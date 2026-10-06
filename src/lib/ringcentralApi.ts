@@ -2,6 +2,7 @@ import type { CallRecord, QosRecord, SmsRecord } from '../types'
 import type { DepartmentMap } from './departmentMap'
 import { departmentFor } from './departmentMap'
 import { ApiError, apiGet, type StatusCallback } from './dashboardApi'
+import { callKindOf } from './metrics'
 
 export type { StatusCallback } from './dashboardApi'
 
@@ -17,6 +18,8 @@ export interface RcUser {
 export interface RcStatus {
   user: RcUser
   environment: 'production' | 'sandbox'
+  /** The time zone set in RingCentral for the signed-in user; "" when RingCentral didn't say. */
+  timeZone?: string
 }
 
 /** Either "the last N days" or an exact from/to window picked on the calendar. */
@@ -37,7 +40,12 @@ export function fetchStatus(): Promise<RcStatus> {
 
 // ---- Calls ----------------------------------------------------------------------
 
-type WireCall = Omit<CallRecord, 'startTime' | 'department'> & { startTime: string }
+type WireCall = Omit<CallRecord, 'startTime' | 'department' | 'kind'> & {
+  startTime: string
+  /** "Voice" or "Fax"; absent from a Worker deployed before faxes were told apart. */
+  type?: string
+  extensionDepartment?: string
+}
 
 interface CallPage {
   records: WireCall[]
@@ -60,8 +68,13 @@ export async function syncCallLog(deptMap: DepartmentMap, window: SyncWindow, on
     if (scope === 'self') params.scope = 'self'
     const data = await apiGet<CallPage>('calls', params, onStatus)
     scope = data.scope
-    for (const r of data.records) {
-      records.push({ ...r, startTime: new Date(r.startTime), department: departmentFor(deptMap, r.extension) })
+    for (const { type, extensionDepartment, ...r } of data.records) {
+      records.push({
+        ...r,
+        kind: callKindOf(type, r.result),
+        startTime: new Date(r.startTime),
+        department: departmentFor(deptMap, r.extension, extensionDepartment),
+      })
     }
     if (!data.hasMore) break
     onStatus?.(`Importing call log (${records.length.toLocaleString()} calls so far)…`)
@@ -75,6 +88,7 @@ interface WireExtension {
   id: string
   name: string
   extensionNumber: string
+  department?: string
 }
 
 type WireSms = Omit<SmsRecord, 'dateTime' | 'extensionName' | 'department' | 'segments'> & { dateTime: string }
@@ -101,7 +115,7 @@ export async function syncSms(deptMap: DepartmentMap, window: SyncWindow, onStat
             ...m,
             dateTime: new Date(m.dateTime),
             extensionName: ext.name,
-            department: departmentFor(deptMap, ext.extensionNumber),
+            department: departmentFor(deptMap, ext.extensionNumber, ext.department),
             segments: 1,
           })
         }

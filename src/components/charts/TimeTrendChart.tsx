@@ -1,5 +1,5 @@
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { formatShortDate } from '../../lib/format'
+import { formatDayKey } from '../../lib/format'
 import { makeTooltipFormatter } from './ChartTooltip'
 
 interface Series {
@@ -16,7 +16,7 @@ interface TimeTrendChartProps {
 }
 
 export function TimeTrendChart({ data, series, valueFormatter, height = 260 }: TimeTrendChartProps) {
-  const tickFormatter = (v: string) => formatShortDate(new Date(v))
+  const tickFormatter = (v: string) => formatDayKey(v)
   const Tip = makeTooltipFormatter(
     tickFormatter,
     series.map((s) => ({ ...s, format: valueFormatter })),

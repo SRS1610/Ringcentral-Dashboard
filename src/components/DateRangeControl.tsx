@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { endOfDay, format, startOfDay, subDays } from 'date-fns'
+import { format, startOfDay, subDays } from 'date-fns'
 import type { DateRangePreset } from '../types'
 import { formatShortDate } from '../lib/format'
+import { timeZoneAbbreviation, zonedMidnight, zonedParts } from '../lib/timezone'
 import { useData } from '../state/DataContext'
 import { useRingCentral } from '../state/RingCentralContext'
 import { RangeCalendar, type DayRange } from './RangeCalendar'
@@ -16,8 +17,16 @@ const PRESETS: { key: Exclude<DateRangePreset, 'custom'>; label: string }[] = [
 
 const fmtLong = (d: Date) => format(d, 'd MMM yyyy')
 
+// The calendar works on plain local dates; these translate a day shown there to and from
+// the same calendar day in the dashboard's time zone.
+const calendarDay = (instant: Date, timeZone: string): Date => {
+  const p = zonedParts(instant, timeZone)
+  return new Date(p.year, p.month - 1, p.day)
+}
+const dayStartIn = (day: Date, timeZone: string, addDays = 0): Date => zonedMidnight(day.getFullYear(), day.getMonth() + 1, day.getDate() + addDays, timeZone)
+
 export function DateRangeControl() {
-  const { preset, setPreset, range, customRange, setCustomRange } = useData()
+  const { preset, setPreset, range, customRange, setCustomRange, timeZone } = useData()
   const rc = useRingCentral()
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState<DayRange | null>(null)
@@ -39,14 +48,15 @@ export function DateRangeControl() {
   }, [open])
 
   const openPicker = () => {
-    const seed = customRange ?? range ?? { start: subDays(new Date(), 6), end: new Date() }
-    setDraft({ start: startOfDay(seed.start), end: startOfDay(seed.end) })
+    const seed = customRange ?? range
+    setDraft(seed ? { start: calendarDay(seed.start, timeZone), end: calendarDay(seed.end, timeZone) } : { start: startOfDay(subDays(new Date(), 6)), end: startOfDay(new Date()) })
     setOpen((o) => !o)
   }
 
   const apply = () => {
     if (!draft) return
-    const picked = { start: startOfDay(draft.start), end: endOfDay(draft.end) }
+    // Whole days on the dashboard's clock: midnight of the first day to the last millisecond of the last.
+    const picked = { start: dayStartIn(draft.start, timeZone), end: new Date(dayStartIn(draft.end, timeZone, 1).getTime() - 1) }
     setCustomRange(picked)
     setOpen(false)
     // Connected: pull exactly this window's calls, SMS and service quality from RingCentral.
@@ -140,7 +150,8 @@ export function DateRangeControl() {
 
       {range && (
         <span className="text-sm tabular-nums" style={{ color: 'var(--text-muted)' }}>
-          {formatShortDate(range.start)} &ndash; {formatShortDate(range.end)}
+          {formatShortDate(range.start, timeZone)} &ndash; {formatShortDate(range.end, timeZone)}
+          <span title={`Days and hours are counted in ${timeZone}. Change it in Settings.`}> · {timeZoneAbbreviation(timeZone, range.end)}</span>
           {customActive && rc.syncing && ' · fetching from RingCentral…'}
         </span>
       )}

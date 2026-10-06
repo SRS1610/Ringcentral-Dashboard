@@ -1,7 +1,11 @@
 export type Direction = 'Inbound' | 'Outbound'
 
+/** RingCentral's call log holds faxes as well as phone calls; call metrics count only voice. */
+export type CallKind = 'voice' | 'fax'
+
 export interface CallRecord {
   callId: string
+  kind: CallKind
   startTime: Date
   direction: Direction
   fromName: string

@@ -5,6 +5,31 @@ import { loadDepartmentMap, saveDepartmentMap, type DepartmentMap } from '../lib
 import { useData } from './DataContext'
 
 const AUTO_SYNC_DAYS = 30
+const DAY_MS = 86_400_000
+/** Longer windows skip the comparison import: it would double an already long fetch. */
+const COMPARE_MAX_DAYS = 92
+
+/**
+ * The window to import so "vs prior period" has something to compare against.
+ * For "last N days" the date presets end at the latest record rather than at now, so the
+ * comparison reaches back 2N days from that record.
+ */
+function comparisonWindow(window: SyncWindow, latestRecord: number | null): { start: Date; end: Date } | null {
+  if (typeof window === 'number') {
+    if (window > COMPARE_MAX_DAYS) return null
+    const now = Date.now()
+    return { start: new Date((latestRecord ?? now) - 2 * window * DAY_MS), end: new Date(now - window * DAY_MS - 1) }
+  }
+  const lengthMs = window.end.getTime() - window.start.getTime()
+  if (lengthMs <= 0 || lengthMs > COMPARE_MAX_DAYS * DAY_MS) return null
+  const end = window.start.getTime() - 1
+  return { start: new Date(end - lengthMs), end: new Date(end) }
+}
+
+function mergeById<T>(primary: T[], extra: T[], idOf: (record: T) => string): T[] {
+  const seen = new Set(primary.map(idOf))
+  return [...primary, ...extra.filter((r) => !seen.has(idOf(r)))]
+}
 
 /**
  * Where the dashboard's server-side RingCentral connection stands:
@@ -37,6 +62,8 @@ interface RingCentralContextValue {
   smsSkipped: number | null
   /** Anything worth knowing about the last service-quality import. */
   qosNote: string | null
+  /** Set when the previous period couldn't be imported, so period-over-period figures are missing. */
+  compareNote: string | null
   departmentMap: DepartmentMap
   unlock: (password: string, remember: boolean) => Promise<void>
   /** Forgets the dashboard password on this browser. */
@@ -53,7 +80,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const isLocked = (e: unknown) => e instanceof ApiError && e.status === 401
 
 export function RingCentralProvider({ children }: { children: ReactNode }) {
-  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral } = useData()
+  const { setCallsFromRingCentral, setSmsFromRingCentral, setQosFromRingCentral, setAccountTimeZone } = useData()
   const [backend, setBackend] = useState<BackendState>('checking')
   const [backendMessage, setBackendMessage] = useState<string | null>(null)
   const [user, setUser] = useState<RcUser | null>(null)
@@ -68,6 +95,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
   const [lastError, setLastError] = useState<string | null>(null)
   const [smsSkipped, setSmsSkipped] = useState<number | null>(null)
   const [qosNote, setQosNote] = useState<string | null>(null)
+  const [compareNote, setCompareNote] = useState<string | null>(null)
   const [departmentMap, setDepartmentMap] = useState<DepartmentMap>(() => loadDepartmentMap())
   // A ref so syncs started from long-lived callbacks always use the latest mapping.
   const deptRef = useRef(departmentMap)
@@ -106,14 +134,18 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       setSyncing(true)
       setLastError(null)
       setQosNote(null)
+      setCompareNote(null)
       const errors: string[] = []
       let anySucceeded = false
       let locked: unknown = null
       const scopes: DataScope[] = []
 
       // Sequential on purpose: RingCentral rate-limits these APIs, so don't double the load.
+      let calls: Awaited<ReturnType<typeof syncCallLog>> | null = null
+      let sms: Awaited<ReturnType<typeof syncSms>> | null = null
+      let qosLoaded: Awaited<ReturnType<typeof syncQos>>['records'] = []
       try {
-        const calls = await syncCallLog(deptRef.current, window, setSyncStatus)
+        calls = await syncCallLog(deptRef.current, window, setSyncStatus)
         setCallsFromRingCentral(calls.records, label)
         scopes.push(calls.scope)
         anySucceeded = true
@@ -123,7 +155,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       }
       if (!locked) {
         try {
-          const sms = await syncSms(deptRef.current, window, setSyncStatus)
+          sms = await syncSms(deptRef.current, window, setSyncStatus)
           setSmsFromRingCentral(sms.records, label)
           setSmsSkipped(sms.skippedExtensions)
           scopes.push(sms.scope)
@@ -140,6 +172,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
           // An empty answer leaves any uploaded Analytics export in place rather than blanking the tab.
           if (qos.records.length > 0) setQosFromRingCentral(qos.records, label)
           else notes.push('RingCentral Analytics returned no call-queue data for this period.')
+          qosLoaded = qos.records
           if (qos.skippedNoSla > 0) notes.push(`${qos.skippedNoSla} queue-day(s) had calls but no SLA classification and are left out of Service Quality.`)
           if (qos.clampedToDays) notes.push(`RingCentral Analytics only keeps about ${qos.clampedToDays} days, so earlier dates have no service quality data.`)
           setQosNote(notes.length > 0 ? notes.join(' ') : null)
@@ -148,6 +181,33 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
           if (isLocked(e)) locked = e
           errors.push(`Service quality: ${message(e)}`)
         }
+      }
+
+      // The period just before, so the tiles can say how this one compares. It loads after the
+      // requested period is already on screen, and a failure here only costs the comparison.
+      const latest = [...(calls?.records ?? []).map((c) => c.startTime.getTime()), ...(sms?.records ?? []).map((m) => m.dateTime.getTime())]
+      const before = comparisonWindow(window, latest.length > 0 ? latest.reduce((a, b) => (a > b ? a : b)) : null)
+      if (!locked && before && (calls || sms)) {
+        const comparing = (text: string) => setSyncStatus(`Previous period, for comparison — ${text.charAt(0).toLowerCase()}${text.slice(1)}`)
+        try {
+          if (calls) {
+            const earlier = await syncCallLog(deptRef.current, before, comparing)
+            setCallsFromRingCentral(mergeById(calls.records, earlier.records, (c) => c.callId), label)
+          }
+          if (sms) {
+            const earlier = await syncSms(deptRef.current, before, comparing)
+            setSmsFromRingCentral(mergeById(sms.records, earlier.records, (m) => m.messageId), label)
+          }
+          if (qosLoaded.length > 0) {
+            const earlier = await syncQos(before, comparing)
+            setQosFromRingCentral([...qosLoaded, ...earlier.records], label)
+          }
+        } catch (e) {
+          if (isLocked(e)) locked = e
+          else setCompareNote(`The previous period couldn't be imported, so some "vs prior period" figures are missing (${message(e)}).`)
+        }
+      } else if (!locked && !before && anySucceeded) {
+        setCompareNote(`Ranges longer than ${COMPARE_MAX_DAYS} days are imported without the period before them, so they show no "vs prior period" figures.`)
       }
 
       if (locked) applyFailure(locked)
@@ -167,6 +227,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       const status = await fetchStatus()
       setUser(status.user)
       setEnvironment(status.environment)
+      setAccountTimeZone(status.timeZone ?? null)
       setBackend('connected')
       setBackendMessage(null)
       setConnecting(false)
@@ -175,7 +236,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       applyFailure(e)
       setConnecting(false)
     }
-  }, [syncNow, applyFailure])
+  }, [syncNow, applyFailure, setAccountTimeZone])
 
   const started = useRef(false)
   useEffect(() => {
@@ -204,6 +265,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
     setLastError(null)
     setSmsSkipped(null)
     setQosNote(null)
+    setCompareNote(null)
     setBackend('locked')
     setBackendMessage(null)
   }, [])
@@ -231,6 +293,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       lastError,
       smsSkipped,
       qosNote,
+      compareNote,
       departmentMap,
       unlock,
       lock,
@@ -253,6 +316,7 @@ export function RingCentralProvider({ children }: { children: ReactNode }) {
       lastError,
       smsSkipped,
       qosNote,
+      compareNote,
       departmentMap,
       unlock,
       lock,

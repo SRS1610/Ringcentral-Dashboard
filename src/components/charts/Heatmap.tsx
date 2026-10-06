@@ -21,7 +21,15 @@ function hourLabel(h: number): string {
   return `${hour12}${period}`
 }
 
-export function Heatmap({ rows, hours, days }: { rows: HeatmapRow[]; hours: number[]; days: string[] }) {
+interface HeatmapProps {
+  rows: HeatmapRow[]
+  hours: number[]
+  days: string[]
+  /** Calls at hours too quiet to earn a column. */
+  outside?: number
+}
+
+export function Heatmap({ rows, hours, days, outside = 0 }: HeatmapProps) {
   const max = Math.max(1, ...rows.map((r) => r.count))
   const byKey = new Map(rows.map((r) => [`${r.day}-${r.hour}`, r.count]))
 
@@ -61,6 +69,11 @@ export function Heatmap({ rows, hours, days }: { rows: HeatmapRow[]; hours: numb
           ))}
         </div>
         <span>More calls</span>
+        {outside > 0 && (
+          <span className="ml-2">
+            {outside.toLocaleString()} {outside === 1 ? 'call' : 'calls'} outside these hours not shown
+          </span>
+        )}
       </div>
     </div>
   )

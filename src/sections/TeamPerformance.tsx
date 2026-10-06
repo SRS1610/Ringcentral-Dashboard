@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useFilteredData } from '../state/useFilteredData'
 import { ChartCard } from '../components/ui/ChartCard'
-import { HorizontalBarChart } from '../components/charts/HorizontalBarChart'
-import { agentLeaderboard, departmentLeaderboard, type AgentLeaderboardRow } from '../lib/metrics'
+import { GroupVolumeCard } from '../components/GroupVolumeCard'
+import { agentLeaderboard, hasDepartments, type AgentLeaderboardRow } from '../lib/metrics'
 import { formatDuration, formatNumber, formatPercent } from '../lib/format'
 
 type SortKey = 'total' | 'inbound' | 'outbound' | 'connected' | 'missed' | 'voicemail' | 'answerRate' | 'avgDuration' | 'talkSeconds'
@@ -14,7 +14,7 @@ const COLUMNS: { key: SortKey; label: string; format: (row: AgentLeaderboardRow)
   { key: 'connected', label: 'Connected', format: (r) => formatNumber(r.connected) },
   { key: 'missed', label: 'Missed', format: (r) => formatNumber(r.missed) },
   { key: 'voicemail', label: 'Voicemail', format: (r) => formatNumber(r.voicemail) },
-  { key: 'answerRate', label: 'Answer rate', format: (r) => formatPercent(r.answerRate) },
+  { key: 'answerRate', label: 'Connect rate', format: (r) => formatPercent(r.answerRate) },
   { key: 'avgDuration', label: 'Avg duration', format: (r) => formatDuration(r.avgDuration) },
   { key: 'talkSeconds', label: 'Talk time', format: (r) => formatDuration(r.talkSeconds) },
 ]
@@ -25,7 +25,8 @@ export function TeamPerformance() {
   const [staffOnly, setStaffOnly] = useState(true)
 
   const agents = useMemo(() => agentLeaderboard(callsInRange), [callsInRange])
-  const departments = useMemo(() => departmentLeaderboard(callsInRange), [callsInRange])
+  // Without departments the chart would be one "Unassigned" bar and the column one repeated word.
+  const showDepartments = useMemo(() => hasDepartments(callsInRange), [callsInRange])
 
   const staff = useMemo(() => agents.filter((a) => a.isStaff), [agents])
   const otherCalls = useMemo(() => agents.filter((a) => !a.isStaff).reduce((sum, a) => sum + a.total, 0), [agents])
@@ -61,11 +62,9 @@ export function TeamPerformance() {
 
   return (
     <div className="flex flex-col gap-5">
-      <ChartCard title="Call volume by department" subtitle="Ranked by total calls in the selected range">
-        <HorizontalBarChart data={departments.map((d) => ({ name: d.department, value: d.total }))} color="var(--series-1)" />
-      </ChartCard>
+      {showDepartments && <GroupVolumeCard records={callsInRange} noun="calls" />}
 
-      <ChartCard title="Agent leaderboard" subtitle="Each metric per team member. Click a column to rank by it." action={toggle}>
+      <ChartCard title="Agent leaderboard" subtitle="Phone calls per team member (faxes excluded). Click a column to rank by it." action={toggle}>
         {sorted.length === 0 ? (
           <p className="text-sm py-6 text-center" style={{ color: 'var(--text-muted)' }}>
             {agents.length === 0 ? 'No calls in this date range.' : 'No calls in this range are tied to a team member. Switch to All lines to see them.'}
@@ -78,9 +77,11 @@ export function TeamPerformance() {
                   <th className="text-left font-medium px-2 py-2" style={{ color: 'var(--text-muted)' }}>
                     Agent
                   </th>
-                  <th className="text-left font-medium px-2 py-2" style={{ color: 'var(--text-muted)' }}>
-                    Department
-                  </th>
+                  {showDepartments && (
+                    <th className="text-left font-medium px-2 py-2" style={{ color: 'var(--text-muted)' }}>
+                      Department
+                    </th>
+                  )}
                   {COLUMNS.map((c) => (
                     <th key={c.key} className="text-right font-medium px-2 py-2 whitespace-nowrap" aria-sort={sortKey === c.key ? 'descending' : undefined}>
                       <button
@@ -107,9 +108,11 @@ export function TeamPerformance() {
                         </span>
                       )}
                     </td>
-                    <td className="px-2 py-2" style={{ color: 'var(--text-secondary)' }}>
-                      {a.department}
-                    </td>
+                    {showDepartments && (
+                      <td className="px-2 py-2" style={{ color: 'var(--text-secondary)' }}>
+                        {a.department}
+                      </td>
+                    )}
                     {COLUMNS.map((c) => (
                       <td key={c.key} className="px-2 py-2 text-right tabular-nums whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>
                         {c.format(a)}
@@ -123,7 +126,7 @@ export function TeamPerformance() {
         )}
         {staffOnly && otherCalls > 0 && (
           <p className="text-xs mt-3" style={{ color: 'var(--text-muted)' }}>
-            {formatNumber(otherCalls)} {otherCalls === 1 ? 'call is' : 'calls are'} not tied to a team member (main line, queues, or calls nobody picked up). Switch to All lines to
+            {formatNumber(otherCalls)} {otherCalls === 1 ? 'call is' : 'calls are'} not tied to a team member (company lines, queues, or calls nobody picked up). Switch to All lines to
             see them.
           </p>
         )}

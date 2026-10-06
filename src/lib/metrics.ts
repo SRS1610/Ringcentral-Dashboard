@@ -1,5 +1,6 @@
-import type { CallRecord, DateRange, QosRecord, SmsRecord } from '../types'
-import { formatDateKey } from './format'
+import type { CallKind, CallRecord, DateRange, QosRecord, SmsRecord } from '../types'
+import { formatDateKey } from './format.ts'
+import { zonedDateKey, zonedParts } from './timezone.ts'
 
 export function filterByRange<T>(records: T[], getDate: (r: T) => Date, range: DateRange): T[] {
   return records.filter((r) => {
@@ -8,13 +9,11 @@ export function filterByRange<T>(records: T[], getDate: (r: T) => Date, range: D
   })
 }
 
-/** Returns the [start, end] window immediately preceding `range`, same length. */
+/** The window of the same length that ends the instant before `range` starts. */
 export function priorRange(range: DateRange): DateRange {
   const lengthMs = range.end.getTime() - range.start.getTime()
-  return {
-    start: new Date(range.start.getTime() - lengthMs - 86400000),
-    end: new Date(range.start.getTime() - 86400000),
-  }
+  const end = range.start.getTime() - 1
+  return { start: new Date(end - lengthMs), end: new Date(end) }
 }
 
 export function pctDelta(current: number, previous: number): number | null {
@@ -22,25 +21,77 @@ export function pctDelta(current: number, previous: number): number | null {
   return ((current - previous) / previous) * 100
 }
 
-// ---- Calls ---------------------------------------------------------------
+// ---- Voice vs fax ----------------------------------------------------------
+// RingCentral keeps faxes in the same log as phone calls. Live data says which is
+// which; an export without a "Type" column is told apart by its result.
 
-const MISSED_RESULTS = new Set(['Missed', 'Rejected', 'Busy'])
+const FAX_RESULTS = new Set(['Received', 'Sent', 'Partial Receive', 'Receive Error', 'Send Error'])
+
+export function isFaxResult(result: string): boolean {
+  return FAX_RESULTS.has(result) || /\bfax\b/i.test(result)
+}
+
+export function callKindOf(type: string | undefined | null, result: string): CallKind {
+  if (type) return /fax/i.test(type) ? 'fax' : 'voice'
+  return isFaxResult(result) ? 'fax' : 'voice'
+}
+
+export function splitByKind(records: CallRecord[]): { voice: CallRecord[]; fax: CallRecord[] } {
+  const voice: CallRecord[] = []
+  const fax: CallRecord[] = []
+  for (const r of records) (r.kind === 'fax' ? fax : voice).push(r)
+  return { voice, fax }
+}
+
+const FAX_OK_RESULTS = new Set(['Received', 'Sent'])
+
+/** Fax counts for a set of fax records. */
+export function faxKpis(fax: CallRecord[]) {
+  const sent = fax.filter((f) => f.direction === 'Outbound').length
+  const failed = fax.filter((f) => !FAX_OK_RESULTS.has(f.result)).length
+  return { total: fax.length, sent, received: fax.length - sent, failed }
+}
+
+// ---- Calls ---------------------------------------------------------------
+// Every function below expects voice calls only (see `splitByKind`).
+
+/** RingCentral logs an answered inbound call as "Accepted" and a connected outbound call as "Call connected". */
+const ANSWERED_RESULTS = new Set(['Call connected', 'Accepted'])
+
+export const isAnswered = (c: CallRecord): boolean => ANSWERED_RESULTS.has(c.result)
+
+const rate = (part: number, whole: number): number => (whole > 0 ? (part / whole) * 100 : 0)
 
 export function callKpis(calls: CallRecord[]) {
   const total = calls.length
-  const connected = calls.filter((c) => c.result === 'Call connected')
-  const missed = calls.filter((c) => MISSED_RESULTS.has(c.result))
-  const answerRate = total > 0 ? (connected.length / total) * 100 : 0
-  const avgDuration = connected.length > 0 ? connected.reduce((s, c) => s + c.durationSeconds, 0) / connected.length : 0
-  const inbound = calls.filter((c) => c.direction === 'Inbound').length
+  const answered = calls.filter(isAnswered)
+  const inboundCalls = calls.filter((c) => c.direction === 'Inbound')
+  const inbound = inboundCalls.length
   const outbound = total - inbound
-  return { total, connected: connected.length, missed: missed.length, answerRate, avgDuration, inbound, outbound }
+  const inboundAnswered = inboundCalls.filter(isAnswered).length
+  const outboundConnected = answered.length - inboundAnswered
+  const avgDuration = answered.length > 0 ? answered.reduce((s, c) => s + c.durationSeconds, 0) / answered.length : 0
+  return {
+    total,
+    inbound,
+    outbound,
+    connected: answered.length,
+    inboundAnswered,
+    outboundConnected,
+    /** Share of inbound calls a person picked up. */
+    inboundAnswerRate: rate(inboundAnswered, inbound),
+    /** Share of outbound calls that connected. */
+    outboundConnectRate: rate(outboundConnected, outbound),
+    missed: inboundCalls.filter((c) => c.result === 'Missed').length,
+    voicemail: inboundCalls.filter((c) => c.result === 'Voicemail').length,
+    avgDuration,
+  }
 }
 
-export function dailyCallVolume(calls: CallRecord[]) {
+export function dailyCallVolume(calls: CallRecord[], timeZone: string) {
   const map = new Map<string, { date: string; inbound: number; outbound: number; total: number }>()
   for (const c of calls) {
-    const key = formatDateKey(c.startTime)
+    const key = zonedDateKey(c.startTime, timeZone)
     const entry = map.get(key) ?? { date: key, inbound: 0, outbound: 0, total: 0 }
     if (c.direction === 'Inbound') entry.inbound += 1
     else entry.outbound += 1
@@ -73,7 +124,7 @@ export function departmentLeaderboard(calls: CallRecord[]): DeptLeaderboardRow[]
   }
   return [...map.entries()]
     .map(([department, records]) => {
-      const connected = records.filter((r) => r.result === 'Call connected')
+      const connected = records.filter(isAnswered)
       return {
         department,
         total: records.length,
@@ -83,6 +134,24 @@ export function departmentLeaderboard(calls: CallRecord[]): DeptLeaderboardRow[]
       }
     })
     .sort((a, b) => b.total - a.total)
+}
+
+const UNASSIGNED = 'Unassigned'
+
+/** True when at least one record carries a real department, so a by-department chart says something. */
+export function hasDepartments(records: { department: string }[]): boolean {
+  return records.some((r) => Boolean(r.department) && r.department !== UNASSIGNED)
+}
+
+/** Record counts per department when departments are set up, otherwise per team member or line. */
+export function volumeByGroup(records: { department: string; extensionName: string }[]): { by: 'department' | 'member'; rows: { name: string; value: number }[] } {
+  const by = hasDepartments(records) ? 'department' : 'member'
+  const map = new Map<string, number>()
+  for (const r of records) {
+    const name = (by === 'department' ? r.department : r.extensionName) || UNASSIGNED
+    map.set(name, (map.get(name) ?? 0) + 1)
+  }
+  return { by, rows: [...map.entries()].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value) }
 }
 
 export interface AgentLeaderboardRow {
@@ -102,8 +171,6 @@ export interface AgentLeaderboardRow {
   talkSeconds: number
 }
 
-const UNASSIGNED = 'Unassigned'
-
 /** Live data says what kind of extension owns a call; CSV data only has a name, which is taken as a person. */
 function isStaffCall(c: CallRecord): boolean {
   if (c.extensionType) return c.extensionType === 'User'
@@ -120,7 +187,7 @@ export function agentLeaderboard(calls: CallRecord[]): AgentLeaderboardRow[] {
   }
   return [...map.entries()]
     .map(([extensionName, records]) => {
-      const connected = records.filter((r) => r.result === 'Call connected')
+      const connected = records.filter(isAnswered)
       const talkSeconds = connected.reduce((s, r) => s + r.durationSeconds, 0)
       const inbound = records.filter((r) => r.direction === 'Inbound').length
       return {
@@ -147,7 +214,7 @@ export function agentLeaderboard(calls: CallRecord[]): AgentLeaderboardRow[] {
 /** A headline metric, or `result:<name>` for one bar of the call outcomes chart. */
 export type CallMetricKey = 'all' | 'inbound' | 'outbound' | 'connected' | 'missed' | 'voicemail' | `result:${string}`
 
-const RESULT_PRESETS: Record<string, CallMetricKey> = { 'Call connected': 'connected', Missed: 'missed', Voicemail: 'voicemail' }
+const RESULT_PRESETS: Record<string, CallMetricKey> = { Missed: 'missed', Voicemail: 'voicemail' }
 
 /** The metric for one call result, as shown in the call outcomes chart. */
 export const metricForResult = (result: string): CallMetricKey => RESULT_PRESETS[result] ?? `result:${result}`
@@ -187,7 +254,7 @@ export function callsForMetric(calls: CallRecord[], key: CallMetricKey): CallRec
     case 'outbound':
       return calls.filter((c) => c.direction === 'Outbound')
     case 'connected':
-      return calls.filter((c) => c.result === 'Call connected')
+      return calls.filter(isAnswered)
     case 'missed':
       return calls.filter((c) => c.result === 'Missed')
     case 'voicemail':
@@ -242,24 +309,47 @@ export function callerBreakdown(calls: CallRecord[]): CallerRow[] {
     .sort((a, b) => b.total - a.total || b.lastCall.getTime() - a.lastCall.getTime())
 }
 
-const HOUR_BUCKETS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+/** Always shown, so a quiet week still draws a readable grid. */
+const CORE_HOURS = { first: 9, last: 17 }
+/** An hour needs this share of all calls to widen the grid; strays are counted in `outside` instead. */
+const MIN_HOUR_SHARE = 0.01
 
-export function callHeatmap(calls: CallRecord[]) {
+/**
+ * Call counts by weekday and hour on the clock of `timeZone`. The hours shown stretch to
+ * cover when calls actually happen rather than assuming a fixed working day.
+ */
+export function callHeatmap(calls: CallRecord[], timeZone: string) {
   const grid = new Map<string, number>()
+  const perHour = new Array<number>(24).fill(0)
   for (const c of calls) {
-    const day = c.startTime.getUTCDay()
-    const hour = c.startTime.getUTCHours()
-    const key = `${day}-${hour}`
+    const { weekday, hour } = zonedParts(c.startTime, timeZone)
+    const key = `${weekday}-${hour}`
     grid.set(key, (grid.get(key) ?? 0) + 1)
+    perHour[hour] += 1
   }
+
+  let first = CORE_HOURS.first
+  let last = CORE_HOURS.last
+  const threshold = Math.max(1, calls.length * MIN_HOUR_SHARE)
+  for (let hour = 0; hour < 24; hour++) {
+    if (perHour[hour] < threshold) continue
+    if (hour < first) first = hour
+    if (hour > last) last = hour
+  }
+  const hours: number[] = []
+  for (let hour = first; hour <= last; hour++) hours.push(hour)
+
   const rows: { day: string; hour: number; count: number }[] = []
+  let shown = 0
   for (let day = 0; day < 7; day++) {
-    for (const hour of HOUR_BUCKETS) {
-      rows.push({ day: DAY_LABELS[day], hour, count: grid.get(`${day}-${hour}`) ?? 0 })
+    for (const hour of hours) {
+      const count = grid.get(`${day}-${hour}`) ?? 0
+      shown += count
+      rows.push({ day: DAY_LABELS[day], hour, count })
     }
   }
-  return { rows, hours: HOUR_BUCKETS, days: DAY_LABELS }
+  return { rows, hours, days: DAY_LABELS, outside: calls.length - shown }
 }
 
 // ---- QoS / Service quality -------------------------------------------------
@@ -319,19 +409,25 @@ export function qosByQueue(qos: QosRecord[]) {
 
 // ---- SMS -------------------------------------------------------------------
 
+/** RingCentral's outbound statuses that mean the message did not get through. */
+const SMS_FAILED_STATUSES = new Set(['DeliveryFailed', 'SendingFailed'])
+
 export function smsKpis(sms: SmsRecord[]) {
   const total = sms.length
-  const delivered = sms.filter((s) => s.status === 'Delivered').length
-  const inbound = sms.filter((s) => s.direction === 'Inbound').length
-  const outbound = total - inbound
-  const deliveryRate = total > 0 ? (delivered / total) * 100 : 0
-  return { total, delivered, inbound, outbound, deliveryRate }
+  const outboundMessages = sms.filter((s) => s.direction === 'Outbound')
+  const outbound = outboundMessages.length
+  const inbound = total - outbound
+  const delivered = outboundMessages.filter((s) => s.status === 'Delivered').length
+  const failed = outboundMessages.filter((s) => SMS_FAILED_STATUSES.has(s.status)).length
+  // Only messages the team sent can be delivered or not; received messages are left out of the rate.
+  const deliveryRate = rate(delivered, outbound)
+  return { total, delivered, failed, inbound, outbound, deliveryRate }
 }
 
-export function smsDailyVolume(sms: SmsRecord[]) {
+export function smsDailyVolume(sms: SmsRecord[], timeZone: string) {
   const map = new Map<string, { date: string; inbound: number; outbound: number; total: number }>()
   for (const s of sms) {
-    const key = formatDateKey(s.dateTime)
+    const key = zonedDateKey(s.dateTime, timeZone)
     const entry = map.get(key) ?? { date: key, inbound: 0, outbound: 0, total: 0 }
     if (s.direction === 'Inbound') entry.inbound += 1
     else entry.outbound += 1

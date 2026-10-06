@@ -2,19 +2,21 @@
 // JSON API under /api/ that signs in to RingCentral server-side with the JWT app
 // credentials held in Worker secrets. The browser never gets those credentials.
 //
-//   GET /api/status                               who the Worker is signed in as
+//   GET /api/status                               who the Worker is signed in as, and the account's time zone
 //   GET /api/calls?from&to&page[&scope]           one page of the call log
 //   GET /api/extensions                           user extensions (for the SMS import)
 //   GET /api/sms?from&to&extensionId&page         one page of one user's SMS log
 //   GET /api/qos?from&to&page                     queue service quality per day (Business Analytics API)
 
 import { ApiError, RcSession, isForbidden, type Env, type RcRecord } from './ringcentral.ts'
-import { mapCall, mapDirectory, mapExtension, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
+import { emptyDirectory, mapCall, mapDirectory, mapExtension, mapQosTimeline, mapSms, type Directory } from './mappers.ts'
 
 const CALL_PAGE_SIZE = '1000'
 const SMS_PAGE_SIZE = '1000'
 const EXTENSION_PAGE_SIZE = '1000'
 const MAX_EXTENSION_PAGES = 10
+const PHONE_NUMBER_PAGE_SIZE = '1000'
+const MAX_PHONE_NUMBER_PAGES = 5
 /** The timeline endpoint returns at most 20 groups (queues) per page. */
 const QOS_PAGE_SIZE = '20'
 /** Business Analytics keeps roughly the last 184 days. */
@@ -110,6 +112,8 @@ async function status(rc: RcSession) {
       isAdmin: Boolean(me.permissions?.admin?.enabled),
     },
     environment: rc.creds.serverUrl.includes('devtest') ? 'sandbox' : 'production',
+    // The IANA zone set in RingCentral for this user, e.g. "America/Los_Angeles"; the dashboard buckets days and hours in it.
+    timeZone: typeof me.regionalSettings?.timezone?.name === 'string' ? me.regionalSettings.timezone.name : '',
   }
 }
 
@@ -124,12 +128,27 @@ async function listExtensions(rc: RcSession, filter: Record<string, string> = {}
   return all
 }
 
+async function listPhoneNumbers(rc: RcSession): Promise<RcRecord[]> {
+  const all: RcRecord[] = []
+  for (let page = 1; page <= MAX_PHONE_NUMBER_PAGES; page++) {
+    const data = await rc.call('/restapi/v1.0/account/~/phone-number', { params: { perPage: PHONE_NUMBER_PAGE_SIZE, page: String(page) } })
+    const records: RcRecord[] = data.records ?? []
+    all.push(...records)
+    if (records.length === 0 || !data.navigation?.nextPage) break
+  }
+  return all
+}
+
 // ---- Extension directory ---------------------------------------------------------
 // A call log record names its owner only by extension id, so the calls route resolves
 // ids against the account's extension list. Every status is included: a team member who
-// has since been disabled still owns their past calls.
+// has since been disabled still owns their past calls. The account's phone numbers are
+// loaded alongside, so an inbound call that never reached anyone is still credited to
+// the line that was dialled.
 
 let directoryMemo: { account: string; expiresAt: number; directory: Directory } | null = null
+
+const isRateLimited = (e: unknown) => e instanceof ApiError && e.code === 'rate_limited'
 
 async function loadDirectory(rc: RcSession): Promise<Directory> {
   const account = `${rc.creds.serverUrl}|${rc.creds.clientId}`
@@ -137,13 +156,23 @@ async function loadDirectory(rc: RcSession): Promise<Directory> {
   let directory: Directory
   let ttl = DIRECTORY_TTL_MS
   try {
-    directory = mapDirectory(await listExtensions(rc))
+    const extensionList = await listExtensions(rc)
+    let phoneNumbers: RcRecord[] = []
+    try {
+      phoneNumbers = await listPhoneNumbers(rc)
+    } catch (e) {
+      if (isRateLimited(e)) throw e
+      // Not retried sooner than the extension list: this is a rate-limit-heavy call, and without it
+      // the only loss is that unanswered inbound calls stay unattributed.
+      console.warn('Phone-number list unavailable; unanswered inbound calls are not matched to a line.', e instanceof Error ? e.message : e)
+    }
+    directory = mapDirectory(extensionList, phoneNumbers)
   } catch (e) {
     // Rate limits are passed on so the browser waits and retries with names intact.
     // Anything else: carry on without the list rather than failing the call log.
-    if (e instanceof ApiError && e.code === 'rate_limited') throw e
+    if (isRateLimited(e)) throw e
     console.warn('Extension list unavailable; call owners fall back to the names on each record.', e instanceof Error ? e.message : e)
-    directory = new Map()
+    directory = emptyDirectory()
     ttl = DIRECTORY_RETRY_MS
   }
   directoryMemo = { account, expiresAt: Date.now() + ttl, directory }
@@ -164,7 +193,7 @@ async function calls(rc: RcSession, url: URL) {
     try {
       const data = await rc.call('/restapi/v1.0/account/~/call-log', { params })
       const records: RcRecord[] = data.records ?? []
-      const directory = records.length > 0 ? await loadDirectory(rc) : new Map()
+      const directory = records.length > 0 ? await loadDirectory(rc) : emptyDirectory()
       return { records: records.map((r) => mapCall(r, directory)), hasMore: hasMore(data, records.length), scope: 'company' }
     } catch (e) {
       if (!isForbidden(e)) throw e

@@ -34,7 +34,7 @@ export function StatTile({ label, value, sublabel, delta, deltaGoodDirection = '
       <div className="text-2xl sm:text-3xl font-semibold tabular-nums truncate" style={{ color: 'var(--text-primary)' }}>
         {value}
       </div>
-      <div className="flex items-center gap-2 text-sm min-h-[20px]">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm min-h-[20px]">
         {hasDelta && (isUp || isDown) && (
           <span
             className="inline-flex items-center gap-1 font-medium tabular-nums"

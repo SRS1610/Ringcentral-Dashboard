@@ -2,21 +2,21 @@ import { useMemo, useState } from 'react'
 import type { CallRecord } from '../types'
 import { ChartCard } from './ui/ChartCard'
 import { callMetricLabel, callerBreakdown, callsForMetric, type CallMetricKey } from '../lib/metrics'
-import { formatDuration, formatNumber } from '../lib/format'
+import { formatDateTime, formatDuration, formatNumber } from '../lib/format'
 
 const PRESETS: CallMetricKey[] = ['all', 'inbound', 'outbound', 'connected', 'missed', 'voicemail']
 const PAGE_SIZE = 25
-
-const formatWhen = (d: Date) => d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 
 interface CallerBreakdownProps {
   calls: CallRecord[]
   metric: CallMetricKey
   onMetricChange: (metric: CallMetricKey) => void
+  /** Zone the "Last call" times are shown in. */
+  timeZone: string
 }
 
 /** Lists the outside parties behind one call metric: who called in, or who was called. */
-export function CallerBreakdown({ calls, metric, onMetricChange }: CallerBreakdownProps) {
+export function CallerBreakdown({ calls, metric, onMetricChange, timeZone }: CallerBreakdownProps) {
   const [query, setQuery] = useState('')
   const [showAll, setShowAll] = useState(false)
 
@@ -108,7 +108,7 @@ export function CallerBreakdown({ calls, metric, onMetricChange }: CallerBreakdo
                       {formatNumber(c.inbound)} / {formatNumber(c.outbound)}
                     </td>
                     <td className="px-2 py-2 text-right tabular-nums whitespace-nowrap">{formatDuration(c.talkSeconds)}</td>
-                    <td className="px-2 py-2 whitespace-nowrap">{formatWhen(c.lastCall)}</td>
+                    <td className="px-2 py-2 whitespace-nowrap">{formatDateTime(c.lastCall, timeZone)}</td>
                     <td className="px-2 py-2">
                       {c.staff.length === 0 ? '—' : c.staff.slice(0, 2).join(', ')}
                       {c.staff.length > 2 && <span style={{ color: 'var(--text-muted)' }}> +{c.staff.length - 2}</span>}

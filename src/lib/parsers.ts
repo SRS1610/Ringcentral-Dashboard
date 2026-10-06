@@ -1,5 +1,6 @@
 import type { CallRecord, QosRecord, SmsRecord } from '../types'
 import { parseCsvText, resolveColumn, toDate, toNumber } from './csv'
+import { callKindOf } from './metrics'
 
 /**
  * Column resolution is tolerant of real-world RingCentral export naming
@@ -23,6 +24,7 @@ export function parseCallLogCsv(text: string): CallRecord[] {
     department: resolveColumn(headers, ['Department', 'Queue', 'Team']),
     duration: resolveColumn(headers, ['Duration (Seconds)', 'Duration', 'Call Duration', 'Length (Seconds)']),
     result: resolveColumn(headers, ['Result', 'Action Result', 'Call Result', 'Status']),
+    type: resolveColumn(headers, ['Type', 'Call Type']),
     recorded: resolveColumn(headers, ['Recorded', 'Recording']),
   }
 
@@ -31,8 +33,10 @@ export function parseCallLogCsv(text: string): CallRecord[] {
     const start = toDate(col.start ? row[col.start] : undefined)
     if (!start) continue
     const direction = (col.direction ? row[col.direction] : '') as CallRecord['direction']
+    const result = (col.result ? row[col.result] : '') || 'Unknown'
     records.push({
       callId: (col.id ? row[col.id] : undefined) ?? `${start.getTime()}-${records.length}`,
+      kind: callKindOf(col.type ? row[col.type] : undefined, result),
       startTime: start,
       direction: direction === 'Outbound' ? 'Outbound' : 'Inbound',
       fromName: (col.fromName ? row[col.fromName] : '') ?? '',
@@ -43,7 +47,7 @@ export function parseCallLogCsv(text: string): CallRecord[] {
       extensionName: (col.extensionName ? row[col.extensionName] : '') ?? 'Unassigned',
       department: (col.department ? row[col.department] : '') || 'Unassigned',
       durationSeconds: toNumber(col.duration ? row[col.duration] : undefined),
-      result: (col.result ? row[col.result] : '') || 'Unknown',
+      result,
       recorded: /^y/i.test((col.recorded ? row[col.recorded] : '') ?? ''),
     })
   }

@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { CallRecord, DatasetSource, DateRange, DateRangePreset, QosRecord, SmsRecord } from '../types'
 import { parseCallLogCsv, parseQosCsv, parseSmsCsv } from '../lib/parsers'
+import { browserTimeZone, isValidTimeZone, zonedDayStart, zonedMonthStart } from '../lib/timezone'
 
 interface DatasetState<T> {
   records: T[]
@@ -29,6 +30,25 @@ interface DataContextValue {
   setCustomRange: (r: DateRange) => void
   customRange: DateRange | null
   dataBounds: DateRange | null
+  /** The zone days, hours and displayed times are worked out in. */
+  timeZone: string
+  /** The zone picked in Settings, or null to follow the RingCentral account (else this browser). */
+  timeZoneChoice: string | null
+  setTimeZoneChoice: (timeZone: string | null) => void
+  /** The zone RingCentral reports for the account; null until live data is connected. */
+  accountTimeZone: string | null
+  setAccountTimeZone: (timeZone: string | null) => void
+}
+
+const TIME_ZONE_KEY = 'rc_dashboard_timezone'
+
+function loadTimeZoneChoice(): string | null {
+  try {
+    const saved = localStorage.getItem(TIME_ZONE_KEY)
+    return isValidTimeZone(saved) ? saved : null
+  } catch {
+    return null
+  }
 }
 
 const DataContext = createContext<DataContextValue | null>(null)
@@ -47,16 +67,13 @@ function computeBounds(dates: Date[]): DateRange | null {
   return { start: new Date(min), end: new Date(max) }
 }
 
-function presetToRange(preset: DateRangePreset, bounds: DateRange | null): DateRange | null {
+/** Presets count whole calendar days in the dashboard's time zone, ending on the day of the latest record. */
+function presetToRange(preset: DateRangePreset, bounds: DateRange | null, timeZone: string): DateRange | null {
   if (!bounds) return null
   const end = bounds.end
   if (preset === 'all' || preset === 'custom') return bounds
-  if (preset === 'mtd') {
-    const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1))
-    return { start: start < bounds.start ? bounds.start : start, end }
-  }
   const days = preset === '7d' ? 7 : preset === '30d' ? 30 : 90
-  const start = new Date(end.getTime() - (days - 1) * 86400000)
+  const start = preset === 'mtd' ? zonedMonthStart(end, timeZone) : zonedDayStart(end, timeZone, -(days - 1))
   return { start: start < bounds.start ? bounds.start : start, end }
 }
 
@@ -66,6 +83,24 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [sms, setSms] = useState<DatasetState<SmsRecord>>(initial<SmsRecord>())
   const [preset, setPreset] = useState<DateRangePreset>('30d')
   const [customRange, setCustomRangeState] = useState<DateRange | null>(null)
+  const [timeZoneChoice, setTimeZoneChoiceState] = useState<string | null>(() => loadTimeZoneChoice())
+  const [accountTimeZone, setAccountTimeZoneState] = useState<string | null>(null)
+  const timeZone = useMemo(() => timeZoneChoice ?? accountTimeZone ?? browserTimeZone(), [timeZoneChoice, accountTimeZone])
+
+  const setTimeZoneChoice = useCallback((next: string | null) => {
+    const value = isValidTimeZone(next) ? next : null
+    setTimeZoneChoiceState(value)
+    try {
+      if (value) localStorage.setItem(TIME_ZONE_KEY, value)
+      else localStorage.removeItem(TIME_ZONE_KEY)
+    } catch {
+      // ignore — the choice just won't persist across sessions
+    }
+  }, [])
+
+  const setAccountTimeZone = useCallback((next: string | null) => {
+    setAccountTimeZoneState(isValidTimeZone(next) ? next : null)
+  }, [])
 
   const setCustomRange = useCallback((r: DateRange) => {
     setCustomRangeState(r)
@@ -160,8 +195,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [calls.records, qos.records, sms.records])
 
   const range = useMemo(
-    () => (preset === 'custom' && customRange ? customRange : presetToRange(preset, dataBounds)),
-    [preset, customRange, dataBounds],
+    () => (preset === 'custom' && customRange ? customRange : presetToRange(preset, dataBounds, timeZone)),
+    [preset, customRange, dataBounds, timeZone],
   )
 
   const value: DataContextValue = {
@@ -181,6 +216,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setCustomRange,
     customRange,
     dataBounds,
+    timeZone,
+    timeZoneChoice,
+    setTimeZoneChoice,
+    accountTimeZone,
+    setAccountTimeZone,
   }
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>

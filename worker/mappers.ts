@@ -17,21 +17,36 @@ export interface WireCall {
   extensionName: string
   /** RingCentral extension type of that owner ("User", "Department", …); "" when it couldn't be looked up. */
   extensionType: string
+  /** The owner's department in the RingCentral directory; "" when none is set there. */
+  extensionDepartment: string
+  /** RingCentral logs faxes in the call log too; the dashboard keeps them out of call metrics. */
+  type: 'Voice' | 'Fax'
   durationSeconds: number
   result: string
   recorded: boolean
 }
 
-/** One entry of the account's extension list, keyed by extension id in a `Directory`. */
+/** Who a call can belong to: an extension from the account's list, or a company number no extension owns. */
 export interface DirectoryEntry {
   name: string
   extensionNumber: string
+  /** RingCentral extension type; "CompanyNumber" for a number that belongs to the account itself. */
   type: string
+  department: string
 }
 
-export type Directory = Map<string, DirectoryEntry>
+export interface Directory {
+  /** Extensions by extension id. */
+  extensions: Map<string, DirectoryEntry>
+  /** The account's own phone numbers (digits only) and who each one rings. */
+  numbers: Map<string, DirectoryEntry>
+}
 
-const NO_DIRECTORY: Directory = new Map()
+export const emptyDirectory = (): Directory => ({ extensions: new Map(), numbers: new Map() })
+
+const NO_DIRECTORY: Directory = emptyDirectory()
+
+const digitsOf = (phoneNumber: unknown): string => String(phoneNumber ?? '').replace(/\D/g, '')
 
 export interface WireSms {
   messageId: string
@@ -46,6 +61,7 @@ export interface WireExtension {
   id: string
   name: string
   extensionNumber: string
+  department: string
 }
 
 export interface WireQos {
@@ -70,7 +86,7 @@ const ANSWERED_RESULTS = new Set(['Accepted', 'Call connected'])
  */
 function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecord): DirectoryEntry {
   const ourSide: RcRecord | undefined = record.direction === 'Outbound' ? record.from : record.to
-  const lookup = (id: unknown) => (id === undefined || id === null ? undefined : directory.get(String(id)))
+  const lookup = (id: unknown) => (id === undefined || id === null ? undefined : directory.extensions.get(String(id)))
 
   let owner = lookup(record.extension?.id) ?? lookup(ourSide?.extensionId)
 
@@ -85,6 +101,13 @@ function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecor
       }
     }
   }
+
+  // An inbound call nobody picked up often carries no extension at all. The number that
+  // was dialled still says whose line it was: a person's direct number, or a company line.
+  if (!owner && record.direction !== 'Outbound') {
+    const dialled = digitsOf(ourSide?.phoneNumber)
+    if (dialled) owner = directory.numbers.get(dialled)
+  }
   if (owner) return owner
 
   const inline: RcRecord | undefined = record.extension?.name || record.extension?.extensionNumber ? record.extension : fallbackExt
@@ -92,6 +115,7 @@ function callOwner(record: RcRecord, directory: Directory, fallbackExt?: RcRecor
     name: inline?.name ?? ourSide?.name ?? 'Unassigned',
     extensionNumber: inline?.extensionNumber ?? ourSide?.extensionNumber ?? '',
     type: inline?.type ?? '',
+    department: inline?.contact?.department ?? '',
   }
 }
 
@@ -108,17 +132,50 @@ export function mapCall(record: RcRecord, directory: Directory = NO_DIRECTORY, f
     extension: owner.extensionNumber,
     extensionName: owner.name || 'Unassigned',
     extensionType: owner.type,
+    extensionDepartment: owner.department,
+    type: record.type === 'Fax' ? 'Fax' : 'Voice',
     durationSeconds: record.duration ?? 0,
     result: record.result ?? 'Unknown',
     recorded: Boolean(record.recording),
   }
 }
 
-export function mapDirectory(records: RcRecord[]): Directory {
-  const directory: Directory = new Map()
-  for (const r of records) {
+const USAGE_LABELS: Record<string, string> = {
+  MainCompanyNumber: 'Main number',
+  AdditionalCompanyNumber: 'Company line',
+  CompanyNumber: 'Company line',
+  CompanyFaxNumber: 'Fax line',
+}
+
+/**
+ * @param extensions    the account's extension list
+ * @param phoneNumbers  the account's phone-number list; each number names the extension it rings, if any
+ */
+export function mapDirectory(extensions: RcRecord[], phoneNumbers: RcRecord[] = []): Directory {
+  const directory = emptyDirectory()
+  for (const r of extensions) {
     if (r.id === undefined || r.id === null) continue
-    directory.set(String(r.id), { name: r.name ?? '', extensionNumber: r.extensionNumber ?? '', type: r.type ?? '' })
+    directory.extensions.set(String(r.id), {
+      name: r.name ?? '',
+      extensionNumber: r.extensionNumber ?? '',
+      type: r.type ?? '',
+      department: r.contact?.department ?? '',
+    })
+  }
+  for (const n of phoneNumbers) {
+    const digits = digitsOf(n.phoneNumber)
+    if (!digits) continue
+    const owner = n.extension?.id === undefined || n.extension?.id === null ? undefined : directory.extensions.get(String(n.extension.id))
+    directory.numbers.set(
+      digits,
+      owner ?? {
+        // A number that rings no single extension (main line, company fax): a shared line, not a person.
+        name: `${String(n.label ?? '').trim() || USAGE_LABELS[n.usageType] || 'Company line'} ${n.phoneNumber}`,
+        extensionNumber: '',
+        type: 'CompanyNumber',
+        department: '',
+      },
+    )
   }
   return directory
 }
@@ -135,7 +192,7 @@ export function mapSms(record: RcRecord): WireSms {
 }
 
 export function mapExtension(record: RcRecord): WireExtension {
-  return { id: String(record.id), name: record.name ?? 'Unassigned', extensionNumber: record.extensionNumber ?? '' }
+  return { id: String(record.id), name: record.name ?? 'Unassigned', extensionNumber: record.extensionNumber ?? '', department: record.contact?.department ?? '' }
 }
 
 // ---- Business Analytics (timeline, grouped by queue, one point per day) ------
