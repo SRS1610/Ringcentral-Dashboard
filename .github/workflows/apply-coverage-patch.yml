@@ -1,0 +1,53 @@
+name: Apply uploaded patch
+
+# One-off: applies comparison-coverage.patch to the source, removes the patch and
+# this workflow, then redeploys. Runs automatically when this file is added to
+# .github/workflows/, or manually from the Actions tab.
+# If the patch does not apply cleanly, or the tests fail, the job fails and nothing is pushed.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/apply-coverage-patch.yml
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply the patch
+        run: |
+          set -euo pipefail
+          git config user.name "Claude"
+          git config user.email "noreply@anthropic.com"
+          # A second download is saved as "comparison-coverage (1).patch"; accept either name.
+          PATCH="$(ls comparison-coverage*.patch | head -n 1)"
+          git am --3way "$PATCH"
+          git rm -q --ignore-unmatch -- comparison-coverage*.patch .github/workflows/apply-coverage-patch.yml
+          git commit -q -m "Remove the applied patch and the one-off apply workflow"
+
+      - name: Test and build before anything is pushed
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Push
+        run: git push
+
+      - name: Redeploy with the new code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy-worker.yml --ref "$GITHUB_REF_NAME"
